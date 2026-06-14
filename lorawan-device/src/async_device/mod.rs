@@ -96,7 +96,7 @@ pub enum SendResponse {
 }
 
 #[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum JoinResponse {
     JoinSuccess,
     NoJoinAccept,
