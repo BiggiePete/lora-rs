@@ -85,7 +85,7 @@ pub enum Error<R> {
 }
 
 #[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SendResponse {
     DownlinkReceived(FcntDown),
     SessionExpired,
