@@ -1,13 +1,12 @@
 [package]
 name = "lora-phy"
 version = "3.0.2-alpha"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/embassy-rs/lora-phy"
 categories = ["embedded", "no-std", "asynchronous"]
 keywords = ["lora", "radio", "embedded-hal-async", "iot", "semtech"]
 description = "A LoRa physical layer implementation enabling utilization of a range of MCU/LoRa board combinations within embedded frameworks supporting embedded-hal-async."
-rust-version = "1.75"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -15,6 +14,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 defmt = { version = "0.3", optional = true }
+embassy-futures = "0.1"
 lora-modulation = { path = "../lora-modulation", version = ">=0.1.2" }
 lorawan-device = { path = "../lorawan-device", default-features = false, version = "0.12", optional = true }
 num-traits = { version = "0.2", default-features = false }
@@ -33,3 +33,9 @@ lorawan-radio = ["dep:lorawan-device"]
 [dev-dependencies]
 # Include lorawan-device unconditionally so all regions are enabled for tests
 lorawan-device = { path = "../lorawan-device" }
+# Bindings to Semtech's reference driver (SWL2001), used to test our
+# implementation against the vendor's SPI byte stream
+smtc-modem-cores = "0.2.1"
+# Derive `OpCode::from_repr` for the sx126x behavioral emulator (test-only)
+strum = { version = "0.28", default-features = false, features = ["derive"] }
+tokio = { version = "1", features = ["rt", "macros"] }

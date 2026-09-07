@@ -1,29 +1,14 @@
 use crate::radio::RfConfig;
-use lorawan::creator::DataPayloadCreator;
-use lorawan::default_crypto::DefaultFactory;
-use lorawan::parser::{DataHeader, DataPayload, FCtrl, PhyPayload};
+use lorawan::creator::DataFrame;
+use lorawan::parser::{self, DataFrameType, DecryptedDataPayload, PhyPayload};
 
-use super::{get_dev_addr, get_key, radio::*, region, timer::*, Device};
+use super::{Device, get_dev_addr, get_key, radio::*, region, timer::*};
 use crate::mac::Session;
-pub(crate) use crate::test_util::{handle_data_uplink_with_link_adr_req, Uplink};
+pub(crate) use crate::test_util::{Uplink, get_crypto, handle_data_uplink_with_link_adr_req};
 use crate::{AppSKey, NwkSKey};
 
 fn default_session() -> Session {
-    Session {
-        nwkskey: NwkSKey::from(get_key()),
-        appskey: AppSKey::from(get_key()),
-        devaddr: get_dev_addr(),
-        fcnt_up: 0,
-        fcnt_down: 0,
-        confirmed: false,
-        uplink: Default::default(),
-        #[cfg(feature = "certification")]
-        override_adr: false,
-        #[cfg(feature = "certification")]
-        override_confirmed: None,
-        #[cfg(feature = "certification")]
-        rx_app_cnt: 0,
-    }
+    Session::new(NwkSKey::from(get_key()), AppSKey::from(get_key()), get_dev_addr())
 }
 
 pub fn session_with_region(region: region::Configuration) -> (RadioChannel, TimerChannel, Device) {
@@ -64,27 +49,32 @@ pub fn handle_class_c_uplink_after_join(
     rx_buffer: &mut [u8],
 ) -> usize {
     if let Some(mut uplink) = uplink {
-        if let PhyPayload::Data(DataPayload::Encrypted(data)) = uplink.get_payload() {
-            let fcnt = data.fhdr().fcnt() as u32;
-            assert!(data.validate_mic(&get_key().into(), fcnt, &DefaultFactory));
-            let uplink = data
-                .decrypt(Some(&get_key().into()), Some(&get_key().into()), fcnt, &DefaultFactory)
-                .unwrap();
-            assert_eq!(uplink.fhdr().fcnt(), 0);
-            let mut phy = DataPayloadCreator::new(rx_buffer).unwrap();
-            let mut fctrl = FCtrl::new(0, false);
-            fctrl.set_ack();
-            phy.set_confirmed(false);
-            phy.set_dev_addr(&[0; 4]);
-            phy.set_uplink(false);
-            phy.set_fctrl(&fctrl);
-            // set ack bit
-            let finished =
-                phy.build(&[], [], &get_key().into(), &get_key().into(), &DefaultFactory).unwrap();
-            finished.len()
-        } else {
-            panic!("Did not decode PhyPayload::Data!");
-        }
+        let bytes = uplink.data_mut();
+        let fcnt = match parser::parse(&*bytes) {
+            Ok(PhyPayload::Data(data)) => {
+                let fcnt = data.fhdr().fcnt() as u32;
+                assert!(data.validate_mic(&get_crypto(), fcnt));
+                fcnt
+            }
+            _ => panic!("Did not decode PhyPayload::Data!"),
+        };
+        let decrypted = DecryptedDataPayload::decrypt_in_place(
+            bytes,
+            Some(&get_crypto()),
+            Some(&get_crypto()),
+            fcnt,
+        )
+        .unwrap();
+        assert_eq!(decrypted.fhdr().fcnt(), 0);
+        // Respond with an empty downlink with the ack bit set
+        let frame = DataFrame {
+            frame_type: DataFrameType::UnconfirmedDown,
+            dev_addr: get_dev_addr(),
+            ack: true,
+            ..Default::default()
+        };
+        let finished = frame.build_into(rx_buffer, &get_crypto(), Some(&get_crypto())).unwrap();
+        finished.len()
     } else {
         panic!("No uplink passed to handle_class_c_uplink_after_join");
     }

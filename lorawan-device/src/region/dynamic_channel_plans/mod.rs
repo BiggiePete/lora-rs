@@ -63,7 +63,6 @@ type ChannelPlan = [Option<Channel>; NUM_CHANNELS_DYNAMIC as usize];
 pub(crate) struct DynamicChannelPlan<R: DynamicChannelRegion> {
     channels: ChannelPlan,
     channel_mask: ChannelMask<9>,
-    last_tx_channel: u8,
     _dynamic_channel_region: PhantomData<R>,
     frequency_valid: fn(u32) -> bool,
 }
@@ -76,7 +75,6 @@ impl<R: DynamicChannelRegion> DynamicChannelPlan<R> {
         Self {
             channels,
             channel_mask: Default::default(),
-            last_tx_channel: Default::default(),
             _dynamic_channel_region: Default::default(),
             frequency_valid: freq_fn,
         }
@@ -102,23 +100,21 @@ impl<R: DynamicChannelRegion> DynamicChannelPlan<R> {
 }
 
 pub(crate) trait DynamicChannelRegion: ChannelRegion {
-    const MAX_RX1_DR_OFFSET: u8;
-    fn join_channels() -> u8;
+    const NUM_JOIN_CHANNELS: u8;
     fn init_channels(channels: &mut ChannelPlan);
-    fn default_rx2_freq() -> u32;
     fn get_rx_datarate(tx_datarate: DR, rx1_dr_offset: u8, window: &Window) -> DR;
 }
 
 impl<R: DynamicChannelRegion> RegionHandler for DynamicChannelPlan<R> {
-    fn process_join_accept<T: AsRef<[u8]>>(&mut self, join_accept: &DecryptedJoinAcceptPayload<T>) {
-        match join_accept.c_f_list() {
+    fn process_join_accept(&mut self, c_f_list: Option<&CfList>) {
+        match c_f_list {
             // Type 0
             Some(CfList::DynamicChannel(cf_list)) => {
                 // CfList of Type 0 may contain up to 5 frequencies, which define
                 // channels J to (J+4). Data rates for these channels is DR0..=DR5
                 for (n, freq) in cf_list.iter().enumerate() {
-                    let index = R::join_channels() as usize + n;
-                    let value = freq.value();
+                    let index = R::NUM_JOIN_CHANNELS as usize + n;
+                    let value = freq.hz();
                     // unused channels are set to 0
                     if value == 0 {
                         self.channels[index] = None;
@@ -199,37 +195,42 @@ impl<R: DynamicChannelRegion> RegionHandler for DynamicChannelPlan<R> {
         R::datarates()[dr as usize].as_ref()
     }
 
-    fn get_tx_dr_and_frequency<RNG: RngCore>(
+    fn select_tx_channel<RNG: RngCore>(
         &mut self,
         rng: &mut RNG,
         datarate: DR,
         frame: &Frame,
-    ) -> (Datarate, u32) {
+    ) -> TxChannel {
         match frame {
             Frame::Join => {
                 // There are at most 3 join channels in dynamic regions,
                 // keep sampling until we get a valid channel.
                 let mut index = (rng.next_u32() & 0b11) as u8;
-                while index >= R::join_channels() {
+                while index >= R::NUM_JOIN_CHANNELS {
                     index = (rng.next_u32() & 0b11) as u8;
                 }
-                self.last_tx_channel = index;
 
                 // SAFETY: Join channels SHALL be always present
                 let channel = self.channels[index as usize].unwrap();
-                (R::datarates()[datarate as usize].clone().unwrap(), channel.frequency)
+                TxChannel {
+                    datarate: R::datarates()[datarate as usize].clone().unwrap(),
+                    dr: datarate,
+                    frequency: channel.ul_frequency(),
+                    rx1_frequency: channel.rx1_frequency(),
+                }
             }
             Frame::Data => {
                 let mut channel = self.get_random_in_range(rng);
                 loop {
-                    if self.channel_mask.is_enabled(channel).unwrap() {
-                        if let Some(ch) = self.channels[channel] {
-                            self.last_tx_channel = channel as u8;
-                            return (
-                                R::datarates()[datarate as usize].clone().unwrap(),
-                                ch.ul_frequency(),
-                            );
-                        }
+                    if self.channel_mask.is_enabled(channel).unwrap()
+                        && let Some(ch) = self.channels[channel]
+                    {
+                        return TxChannel {
+                            datarate: R::datarates()[datarate as usize].clone().unwrap(),
+                            dr: datarate,
+                            frequency: ch.ul_frequency(),
+                            rx1_frequency: ch.rx1_frequency(),
+                        };
                     }
                     channel = self.get_random_in_range(rng)
                 }
@@ -237,12 +238,8 @@ impl<R: DynamicChannelRegion> RegionHandler for DynamicChannelPlan<R> {
         }
     }
 
-    fn get_rx_frequency(&self, _frame: &Frame, window: &Window) -> u32 {
-        match window {
-            // SAFETY: self.last_tx_channel will be populated after correct channel is chosen
-            Window::_1 => self.channels[self.last_tx_channel as usize].unwrap().rx1_frequency(),
-            Window::_2 => R::default_rx2_freq(),
-        }
+    fn get_rx2_frequency(&self) -> u32 {
+        R::DEFAULT_RX2_FREQ
     }
 
     fn get_rx_datarate(&self, tx_datarate: DR, rx1_dr_offset: u8, window: &Window) -> DR {
@@ -264,22 +261,25 @@ impl<R: DynamicChannelRegion> RegionHandler for DynamicChannelPlan<R> {
     /// Update channel's downlink frequency for RX1 slot
     fn channel_dl_update(&mut self, index: u8, freq: u32) -> (bool, bool) {
         let freq_valid = self.frequency_valid(freq);
+        // A crafted DlChannelReq can carry any index in 0..=255; reject anything
+        // past the channel plan before indexing self.channels (len NUM_CHANNELS_DYNAMIC).
+        if index >= NUM_CHANNELS_DYNAMIC {
+            return (freq_valid, false);
+        }
         if self.channel_mask.is_enabled(index as usize).is_ok()
             && self.channel_mask.is_enabled(index as usize).unwrap()
+            && let Some(mut channel) = self.channels[index as usize]
+            && channel.frequency != 0
         {
-            if let Some(mut channel) = self.channels[index as usize] {
-                if channel.frequency != 0 {
-                    channel.dl_frequency = if freq == channel.frequency {
-                        // Reset downlink frequency
-                        None
-                    } else {
-                        // Update downlink frequency
-                        Some(freq)
-                    };
-                    self.channels[index as usize] = Some(channel);
-                    return (freq_valid, true);
-                }
-            }
+            channel.dl_frequency = if freq == channel.frequency {
+                // Reset downlink frequency
+                None
+            } else {
+                // Update downlink frequency
+                Some(freq)
+            };
+            self.channels[index as usize] = Some(channel);
+            return (freq_valid, true);
         }
         (freq_valid, false)
     }
@@ -291,7 +291,12 @@ impl<R: DynamicChannelRegion> RegionHandler for DynamicChannelPlan<R> {
         dr: Option<DataRateRange>,
     ) -> (bool, bool) {
         // Join channels are readonly - these cannot be modified!
-        if index < R::join_channels() {
+        if index < R::NUM_JOIN_CHANNELS {
+            return (false, false);
+        }
+        // A crafted NewChannelReq can carry any index in 0..=255; reject anything
+        // past the channel plan before indexing self.channels (len NUM_CHANNELS_DYNAMIC).
+        if index >= NUM_CHANNELS_DYNAMIC {
             return (false, false);
         }
         // Disable channel if frequency is 0
@@ -304,8 +309,12 @@ impl<R: DynamicChannelRegion> RegionHandler for DynamicChannelPlan<R> {
 
         // Check if DataRateRange is valid and supported
         if let Some(r) = dr {
-            let dr_supported = (r.min_data_rate()..=r.max_data_rate())
-                .all(|c| (R::datarates()[c as usize]).is_some());
+            // max_data_rate() comes from a received NewChannelReq and can be up to 15
+            // (DR15 / RFU); datarates() only has NUM_DATARATES (15) entries, so an
+            // unchecked range would index past it. Reject anything out of range.
+            let dr_supported = r.max_data_rate() < NUM_DATARATES
+                && (r.min_data_rate()..=r.max_data_rate())
+                    .all(|c| (R::datarates()[c as usize]).is_some());
 
             if freq_valid && dr_supported {
                 self.channels[index as usize] = Some(Channel::new_with_dr(freq, r));
@@ -322,5 +331,71 @@ impl<R: DynamicChannelRegion> RegionHandler for DynamicChannelPlan<R> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(all(test, feature = "region-eu868"))]
+mod tests {
+    use super::*;
+    use crate::region::{Configuration, Region};
+
+    // A valid EU868 channel frequency (863..=870 MHz), used to reach the indexing paths.
+    const VALID_FREQ: u32 = 868_100_000;
+    const VALID_INDEX: u8 = 5;
+
+    // NewChannelReq carries a raw u8 channel index. Indices beyond the channel plan
+    // (NUM_CHANNELS_DYNAMIC) must be rejected, not used to index self.channels.
+    #[test]
+    fn new_channel_index_out_of_range_is_rejected() {
+        let dr = Some(DataRateRange::new_range(DR::_0, DR::_5));
+        for index in NUM_CHANNELS_DYNAMIC..=u8::MAX {
+            let mut config = Configuration::new(Region::EU868);
+            // create path (freq != 0) must not panic and must NAK
+            assert_eq!(config.handle_new_channel(index, VALID_FREQ, dr), (false, false));
+            // disable path (freq == 0) must not panic and must NAK
+            assert_eq!(config.handle_new_channel(index, 0, dr), (false, false));
+        }
+    }
+
+    // DlChannelReq shares the same raw u8 index; an out-of-range index must not
+    // index self.channels either.
+    #[test]
+    fn channel_dl_update_index_out_of_range_is_rejected() {
+        for index in NUM_CHANNELS_DYNAMIC..=u8::MAX {
+            let mut config = Configuration::new(Region::EU868);
+            // frequency-valid flag may be true, but the update flag must be false
+            let (_freq_ack, updated) = config.channel_dl_update(index, VALID_FREQ);
+            assert!(!updated);
+        }
+    }
+
+    // In-range indices past the join channels still work as before.
+    #[test]
+    fn new_channel_in_range_index_is_accepted() {
+        let mut config = Configuration::new(Region::EU868);
+        let dr = Some(DataRateRange::new_range(DR::_0, DR::_5));
+        let index = NUM_CHANNELS_DYNAMIC - 1;
+        assert_eq!(config.handle_new_channel(index, VALID_FREQ, dr), (true, true));
+    }
+
+    // NewChannelReq encodes the DR range in one byte; the high nibble (max DR) can be
+    // up to 15, but datarates() only has NUM_DATARATES entries. A range reaching 15
+    // must be NAK'd, not used to index datarates().
+    #[test]
+    fn new_channel_out_of_range_data_rate_is_rejected() {
+        // 0xFF => min DR 15, max DR 15. DataRateRange::new accepts it (max >= min), and
+        // the range 15..=15 indexes datarates()[15] directly, past its length.
+        let dr = Some(DataRateRange::new_from_raw(0xFF));
+        let mut config = Configuration::new(Region::EU868);
+        // Must not panic; frequency is valid but the DR range is not supported.
+        assert_eq!(config.handle_new_channel(VALID_INDEX, VALID_FREQ, dr), (true, false));
+    }
+
+    // A supported DR range is still accepted and creates the channel.
+    #[test]
+    fn new_channel_in_range_data_rate_is_accepted() {
+        let dr = Some(DataRateRange::new_range(DR::_0, DR::_5));
+        let mut config = Configuration::new(Region::EU868);
+        assert_eq!(config.handle_new_channel(VALID_INDEX, VALID_FREQ, dr), (true, true));
     }
 }

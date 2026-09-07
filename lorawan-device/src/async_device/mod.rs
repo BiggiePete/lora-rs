@@ -2,9 +2,9 @@
 //! allowing for asynchronous radio implementations. Requires the `async` feature.
 use super::mac::{self, FcntDown, Frame, Mac, Window};
 pub use super::{
+    Downlink, JoinMode,
     mac::{NetworkCredentials, SendData, Session},
     region::{self, Region},
-    Downlink, JoinMode,
 };
 use heapless::Vec;
 use rand_core::RngCore;
@@ -16,7 +16,6 @@ use crate::{
 };
 
 pub mod radio;
-use lorawan::default_crypto::DefaultFactory;
 
 #[cfg(feature = "embassy-time")]
 mod embassy_time;
@@ -25,6 +24,8 @@ pub use embassy_time::EmbassyTimer;
 
 #[cfg(feature = "multicast")]
 use crate::mac::multicast;
+#[cfg(feature = "multicast")]
+use lorawan::default_crypto::DefaultCrypto;
 #[cfg(feature = "multicast")]
 pub use lorawan::{
     keys::{AppKey, AppSKey, GenAppKey, McAppSKey, McNetSKey, McRootKey},
@@ -230,8 +231,8 @@ where
     #[cfg(feature = "multicast")]
     /// Set the McKEKey for multicast session key derivation by providing a McRootKey.
     pub fn set_multicast_ke_key(&mut self, mc_root_key: McRootKey) {
-        let crypto = DefaultFactory;
-        let key = lorawan::keys::McKEKey::derive_from(&crypto, &mc_root_key);
+        let crypto = DefaultCrypto::new(mc_root_key.inner());
+        let key = lorawan::keys::McKEKey::derive_from(&crypto);
         self.mac.multicast.mc_k_e_key = Some(key);
     }
 
@@ -240,8 +241,8 @@ where
     /// GenAppKey. The McRootKey is derived from this using `McRootKey = aes128_encrypt(GenAppKey, 0x00 | pad16) `
     /// and then the McKEKey is derived from the McRootKey.
     pub fn set_multicast_ke_key_from_gen_app_key(&mut self, key: GenAppKey) {
-        let crypto = DefaultFactory;
-        let mc_root_key = McRootKey::derive_from_gen_app_key(&crypto, &key);
+        let crypto = DefaultCrypto::new(key.inner());
+        let mc_root_key = McRootKey::derive_from_gen_app_key(&crypto);
         self.set_multicast_ke_key(mc_root_key);
     }
 
@@ -250,8 +251,8 @@ where
     /// GenAppKey. The McRootKey is derived from this using `McRootKey = aes128_encrypt(AppKey, 0x20 | pad16) `
     /// and then the McKEKey is derived from the McRootKey.
     pub fn set_multicast_ke_key_from_app_key(&mut self, key: AppKey) {
-        let crypto = DefaultFactory;
-        let mc_root_key = McRootKey::derive_from_app_key(&crypto, &key);
+        let crypto = DefaultCrypto::new(key.inner());
+        let mc_root_key = McRootKey::derive_from_app_key(&crypto);
         self.set_multicast_ke_key(mc_root_key);
     }
 
@@ -300,6 +301,26 @@ where
         self.mac.configuration.data_rate = datarate;
     }
 
+    /// Whether Adaptive Data Rate (ADR) is enabled.
+    ///
+    /// When enabled, uplinks set the FCtrl ADR bit so the network may adjust
+    /// data rate and TX power via LinkADRReq. ADRACKReq / DR backoff also run
+    /// when connectivity is lost.
+    pub fn get_adr(&self) -> bool {
+        self.mac.configuration.adr_enabled
+    }
+
+    /// Enable or disable Adaptive Data Rate (ADR).
+    ///
+    /// ADR is enabled by default. Disable it for mobile devices or when the
+    /// application manages data rate itself.
+    pub fn set_adr(&mut self, enabled: bool) {
+        self.mac.configuration.adr_enabled = enabled;
+        if !enabled && let Some(session) = self.mac.get_session_mut() {
+            session.adr_ack_cnt = 0;
+        }
+    }
+
     /// Join the LoRaWAN network asynchronously. The returned future completes when
     /// the LoRaWAN network has been joined successfully, or an error has occurred.
     ///
@@ -310,7 +331,7 @@ where
     pub async fn join(&mut self, join_mode: &JoinMode) -> Result<JoinResponse, Error<R::PhyError>> {
         match join_mode {
             JoinMode::OTAA { deveui, appeui, appkey } => {
-                let (tx_config, _) = self.mac.join_otaa::<G, N>(
+                let (tx_config, rx_windows, _) = self.mac.join_otaa::<G, N>(
                     &mut self.rng,
                     NetworkCredentials::new(*appeui, *deveui, *appkey),
                     &mut self.radio_buffer,
@@ -325,7 +346,7 @@ where
 
                 // Receive join response within RX window
                 self.timer.reset();
-                Ok(self.rx_downlink(&Frame::Join, ms).await?.into())
+                Ok(self.rx_downlink(&Frame::Join, ms, &rx_windows).await?.into())
             }
             JoinMode::ABP { nwkskey, appskey, devaddr } => {
                 self.mac.join_abp(*nwkskey, *appskey, *devaddr);
@@ -351,7 +372,7 @@ where
         confirmed: bool,
     ) -> Result<SendResponse, Error<R::PhyError>> {
         // Prepare transmission buffer
-        let (tx_config, _fcnt_up) = self.mac.send::<G, N>(
+        let (tx_config, rx_windows, _fcnt_up) = self.mac.send::<G, N>(
             &mut self.rng,
             &mut self.radio_buffer,
             &SendData { data, fport, confirmed },
@@ -365,7 +386,7 @@ where
 
         // Wait for received data within window
         self.timer.reset();
-        Ok(self.rx_downlink(&Frame::Data, ms).await?.into())
+        Ok(self.rx_downlink(&Frame::Data, ms, &rx_windows).await?.into())
     }
 
     /// Take the downlink data from the device. This is typically called after a
@@ -390,7 +411,7 @@ where
         &mut self,
         duration: u32,
     ) -> Result<Option<mac::Response>, Error<R::PhyError>> {
-        self.radio.low_power().await.map_err(Error::Radio)?;
+        self.radio.warm_sleep().await.map_err(Error::Radio)?;
         self.timer.at(duration.into()).await;
         Ok(None)
     }
@@ -401,10 +422,10 @@ where
         duration: u32,
     ) -> Result<Option<mac::Response>, Error<R::PhyError>> {
         use self::radio::RxQuality;
-        use futures::{future::select, future::Either, pin_mut};
+        use futures::{future::Either, future::select, pin_mut};
 
         if !self.class_c {
-            self.radio.low_power().await.map_err(Error::Radio)?;
+            self.radio.warm_sleep().await.map_err(Error::Radio)?;
             self.timer.at(duration.into()).await;
             return Ok(None);
         }
@@ -512,40 +533,57 @@ where
         &mut self,
         frame: &Frame,
         window_delay: u32,
+        rx_windows: &mac::RxWindows,
     ) -> Result<mac::Response, Error<R::PhyError>> {
         self.radio_buffer.clear();
 
-        let rx1_start_delay = self.mac.get_rx_delay(frame, &Window::_1) + window_delay
-            - self.radio.get_rx_window_lead_time_ms();
+        let rx1_rf = rx_windows.get(&Window::_1);
+        let rx1_timing = self.radio.get_rx_window_timing(&rx1_rf);
+        let rx1_start_delay = apply_window_offset(
+            self.mac.get_rx_delay(frame, &Window::_1).saturating_add(window_delay),
+            rx1_timing.offset_ms,
+        );
 
         debug!("Starting RX1 in {} ms.", rx1_start_delay);
         // sleep or RXC
         let _ = self.between_windows(rx1_start_delay).await?;
 
         // RX1
-        let rx_config =
-            self.mac.get_rx_config(self.radio.get_rx_window_buffer(), frame, &Window::_1);
+        let rx_config = rx_windows.rx_config(self.radio.get_rx_window_buffer(), &Window::_1);
         debug!("Configuring RX1 window with config {}.", rx_config);
-        self.radio.setup_rx(rx_config).await.map_err(Error::Radio)?;
+        self.radio.setup_rx_window(rx_config, rx1_timing).await.map_err(Error::Radio)?;
 
         if let Some(response) = self.rx_listen(&rx_config.rf).await? {
             debug!("RX1 received {}", response);
+            self.window_complete().await?;
             return Ok(response);
         }
+        // No window_complete between RX1 and RX2: the radio keeps its
+        // retained configuration through the gap so RX2 gets the fast warm
+        // wake (class C instead returns to RXC listening right away).
+        #[cfg(feature = "class-c")]
+        if self.class_c {
+            self.window_complete().await?;
+        }
 
-        let rx2_start_delay = self.mac.get_rx_delay(frame, &Window::_2) + window_delay
-            - self.radio.get_rx_window_lead_time_ms();
+        let rx2_rf = rx_windows.get(&Window::_2);
+        let rx2_timing = self.radio.get_rx_window_timing(&rx2_rf);
+        let rx2_start_delay = apply_window_offset(
+            self.mac.get_rx_delay(frame, &Window::_2).saturating_add(window_delay),
+            rx2_timing.offset_ms,
+        );
         debug!("RX1 did not receive anything. Awaiting RX2 for {} ms.", rx2_start_delay);
         // sleep or RXC
         let _ = self.between_windows(rx2_start_delay).await?;
 
         // RX2
-        let rx_config =
-            self.mac.get_rx_config(self.radio.get_rx_window_buffer(), frame, &Window::_2);
+        let rx_config = rx_windows.rx_config(self.radio.get_rx_window_buffer(), &Window::_2);
         debug!("Configuring RX2 window with config {}.", rx_config);
-        self.radio.setup_rx(rx_config).await.map_err(Error::Radio)?;
+        self.radio.setup_rx_window(rx_config, rx2_timing).await.map_err(Error::Radio)?;
 
-        if let Some(response) = self.rx_listen(&rx_config.rf).await? {
+        let response = self.rx_listen(&rx_config.rf).await?;
+        self.window_complete().await?;
+        if let Some(response) = response {
             debug!("RX2 received {}", response);
             return Ok(response);
         }
@@ -631,7 +669,6 @@ where
                 }
                 RxStatus::RxTimeout => None,
             };
-        self.window_complete().await?;
         Ok(response)
     }
 
@@ -666,6 +703,16 @@ where
     }
 }
 
+/// Timing for one receive window: when to start radio setup relative to the
+/// nominal window time, and the timeout to program into the radio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxWindowTiming {
+    /// Offset from the nominal receive-window time at which radio setup starts.
+    pub offset_ms: i32,
+    /// Preamble-detection timeout programmed into the radio.
+    pub timeout_symbols: u16,
+}
+
 /// Allows to fine-tune the beginning and end of the receive windows for a specific board and runtime.
 pub trait Timings {
     /// How many milliseconds before the RX window should the SPI transaction start?
@@ -678,5 +725,39 @@ pub trait Timings {
     /// < Self::get_rx_window_lead_time_ms`.
     fn get_rx_window_buffer(&self) -> u32 {
         self.get_rx_window_lead_time_ms()
+    }
+
+    /// Calculate timing for a receive window's modulation parameters.
+    ///
+    /// The default starts `lead_time` early and adds `buffer` to a 13-symbol
+    /// preamble timeout.
+    fn get_rx_window_timing(&self, rf: &RfConfig) -> RxWindowTiming {
+        const PREAMBLE_SYMBOLS: u16 = 13;
+        RxWindowTiming {
+            offset_ms: -(self.get_rx_window_lead_time_ms().min(i32::MAX as u32) as i32),
+            timeout_symbols: PREAMBLE_SYMBOLS
+                .saturating_add(rf.bb.delay_in_symbols_ceil(self.get_rx_window_buffer())),
+        }
+    }
+}
+
+fn apply_window_offset(nominal_ms: u32, offset_ms: i32) -> u32 {
+    if offset_ms >= 0 {
+        nominal_ms.saturating_add(offset_ms as u32)
+    } else {
+        nominal_ms.saturating_sub(offset_ms.unsigned_abs())
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::apply_window_offset;
+
+    #[test]
+    fn window_offset_is_applied_without_wrapping() {
+        assert_eq!(940, apply_window_offset(1_000, -60));
+        assert_eq!(1_060, apply_window_offset(1_000, 60));
+        assert_eq!(0, apply_window_offset(10, -60));
+        assert_eq!(u32::MAX, apply_window_offset(u32::MAX - 10, 60));
     }
 }

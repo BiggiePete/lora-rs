@@ -1,5 +1,8 @@
 mod radio_kind_params;
 
+#[cfg(test)]
+mod test;
+
 use embedded_hal_async::delay::DelayNs;
 use embedded_hal_async::spi::*;
 pub use radio_kind_params::TcxoCtrlVoltage;
@@ -174,6 +177,16 @@ where
             + (((steps_frac << SX126X_PLL_STEP_SHIFT_AMOUNT) + (SX126X_PLL_STEP_SCALED >> 1)) / SX126X_PLL_STEP_SCALED)
     }
 
+    #[cfg(test)]
+    fn take_spi(self) -> SPI {
+        self.intf.spi
+    }
+
+    #[cfg(test)]
+    fn spi_mut(&mut self) -> &mut SPI {
+        &mut self.intf.spi
+    }
+
     // SX162x WriteRegister wrapper for single u8 value writes
     async fn reg_w_8(&mut self, reg: Register, value: u8) -> Result<(), RadioError> {
         self.intf
@@ -201,18 +214,23 @@ where
     }
 }
 
-// Convert u8 sync word to two byte value expected by sx126x
-fn convert_sync_word(sync_word: u8) -> [u8; 2] {
-    [(sync_word & 0xF0) | 0x04, ((sync_word & 0x0F) << 4) | 0x04]
-}
-
 impl<SPI, IV, C> RadioKind for Sx126x<SPI, IV, C>
 where
     SPI: SpiDevice<u8>,
     IV: InterfaceVariant,
     C: Sx126xVariant,
 {
-    async fn init_lora(&mut self, sync_word: u8) -> Result<(), RadioError> {
+    // The sx126x keeps its configuration across a warm-start sleep, so the
+    // stack can use the low-current retention sleep between receive windows.
+    const SUPPORTS_WARM_START: bool = true;
+
+    const MAX_SINGLE_RX_SYMBOLS: u16 = SX126X_MAX_LORA_SYMB_NUM_TIMEOUT as u16;
+
+    // SetStopRxTimerOnPreamble(1) gives the SetRx tick timeout the same
+    // stop-on-preamble semantics as the symbol timeout.
+    const SUPPORTS_TIMED_SINGLE_RX: bool = true;
+
+    async fn init_lora(&mut self, sync_word: u16) -> Result<(), RadioError> {
         // DC-DC regulator setup (default is LDO)
         if self.config.use_dcdc {
             let reg_data = [OpCode::SetRegulatorMode.value(), RegulatorMode::UseDCDC.value()];
@@ -261,7 +279,7 @@ where
             .write(&[OpCode::SetPacketType.value(), PacketType::LoRa.value()], false)
             .await?;
         // ...and network syncword
-        let word = convert_sync_word(sync_word);
+        let word = sync_word.to_be_bytes();
         let lora_syncword_set = [
             OpCode::WriteRegister.value(),
             Register::LoRaSyncword.addr1(),
@@ -273,6 +291,16 @@ where
         // Update register list to support warm starts from sleep mode
         self.update_retention_list().await?;
         Ok(())
+    }
+
+    async fn set_lora_sync_word(&mut self, sync_word: u16) -> Result<(), RadioError> {
+        let word = sync_word.to_be_bytes();
+        let lora_syncword_set = [
+            OpCode::WriteRegister.value(),
+            Register::LoRaSyncword.addr1(),
+            Register::LoRaSyncword.addr2(),
+        ];
+        self.intf.write_with_payload(&lora_syncword_set, &word, false).await
     }
 
     fn create_modulation_params(
@@ -394,89 +422,38 @@ where
         mdltn_params: Option<&ModulationParams>,
         is_tx_prep: bool,
     ) -> Result<(), RadioError> {
-        let tx_params_power;
         let ramp_time = match is_tx_prep {
             true => RampTime::Ramp40Us,   // for instance, prior to TX or CAD
             false => RampTime::Ramp200Us, // for instance, on initialization
         };
 
+        // PA-specific preconditions
         match self.config.chip.get_device_sel() {
             DeviceSel::LowPowerPA => {
-                const LOW_POWER_MIN: i32 = -17;
-                const LOW_POWER_MAX: i32 = 15;
-                // Clamp power between [-17, 15] dBm
-                let txp = output_power.clamp(LOW_POWER_MIN, LOW_POWER_MAX);
-
-                if txp == 15 {
-                    if let Some(m_p) = mdltn_params {
-                        if m_p.frequency_in_hz < 400_000_000 {
-                            return Err(RadioError::InvalidOutputPowerForFrequency);
-                        }
-                    }
-                }
-
-                // For SX1261:
-                // if f < 400 MHz, paDutyCycle should not be higher than 0x04,
-                // if f > 400 Mhz, paDutyCycle should not be higher than 0x07.
-                // From Table 13-21: PA Operating Modes with Optimal Settings
-                match txp {
-                    LOW_POWER_MAX => {
-                        self.set_pa_config(0x06, 0x00, DeviceSel::LowPowerPA).await?;
-                        tx_params_power = 14;
-                    }
-                    11..=14 => {
-                        self.set_pa_config(0x04, 0x00, DeviceSel::LowPowerPA).await?;
-                        tx_params_power = txp as u8;
-                    }
-                    // 10 and less
-                    LOW_POWER_MIN..=10 => {
-                        self.set_pa_config(0x01, 0x00, DeviceSel::LowPowerPA).await?;
-                        // table indicates 10 dBm => txp = 13, therefore we add 3 to values below 10
-                        tx_params_power = txp as u8 + 3;
-                    }
-                    _ => unreachable!("Invalid output power value for low power PA!"),
+                // For SX1261 the +15 dBm row is only valid above 400 MHz
+                // (below, paDutyCycle must not exceed 0x04)
+                if output_power >= 15
+                    && let Some(m_p) = mdltn_params
+                    && m_p.frequency_in_hz < 400_000_000
+                {
+                    return Err(RadioError::InvalidOutputPowerForFrequency);
                 }
             }
             DeviceSel::HighPowerPA => {
-                const HIGH_POWER_MIN: i32 = -9;
-                const HIGH_POWER_MAX: i32 = 22;
-                // Clamp power between [-9, 22] dBm
-                let txp = output_power.clamp(HIGH_POWER_MIN, HIGH_POWER_MAX);
-
                 // Provide better resistance of the SX1262 Tx to antenna mismatch
                 // Bits 4-1 must be set to `1111`
                 let tx_clamp_val = self.reg_r_8(Register::TxClampCfg).await?;
                 self.reg_w_8(Register::TxClampCfg, tx_clamp_val | 0b11110).await?;
-
-                // From Table 13-21: PA Operating Modes with Optimal Settings
-                match txp {
-                    21..=HIGH_POWER_MAX => {
-                        self.set_pa_config(0x04, 0x07, DeviceSel::HighPowerPA).await?;
-                        tx_params_power = 22;
-                    }
-                    18..=20 => {
-                        self.set_pa_config(0x03, 0x05, DeviceSel::HighPowerPA).await?;
-                        // table indicates 20 dBm => txp = 22, therefore we add 2 to this range
-                        tx_params_power = txp as u8 + 2;
-                    }
-                    15..=17 => {
-                        self.set_pa_config(0x02, 0x03, DeviceSel::HighPowerPA).await?;
-                        // table indicates 17 dBm => txp = 22, therefore we add 5 to this range
-                        tx_params_power = txp as u8 + 5;
-                    }
-                    HIGH_POWER_MIN..=14 => {
-                        self.set_pa_config(0x02, 0x02, DeviceSel::HighPowerPA).await?;
-                        // table indicates 14 dBm => txp = 22, therefore we should add 8 to this range
-                        // this however seems to be wrong when looking at the reference driver
-                        // https://github.com/STMicroelectronics/STM32CubeWL/blob/139e8d28bcec6af78dec8b52a9b9f9057868cc2e/Middlewares/Third_Party/SubGHz_Phy/stm32_radio_driver/radio_driver.c#L675
-                        tx_params_power = txp as u8;
-                    }
-                    _ => {
-                        unreachable!("Invalid output power value for high power PA!")
-                    }
-                }
             }
         }
+
+        // PA config and SetTxParams power come from the variant's const
+        // power table (datasheet Table 13-21 for discrete parts; boards
+        // with their own PA characterization supply their own table)
+        let (entry, tx_params_power) = self.config.chip.pa_table().lookup(output_power);
+        self.set_pa_config(entry.pa_duty_cycle, entry.hp_max, self.config.chip.get_device_sel())
+            .await?;
+
         let op_code_and_tx_params = [OpCode::SetTxParams.value(), tx_params_power, ramp_time.value()];
         self.intf.write(&op_code_and_tx_params, false).await
     }
@@ -601,7 +578,7 @@ where
         self.intf.write(&op_code_and_true_flag, false).await?;
 
         let num_symbols = match rx_mode {
-            RxMode::DutyCycle(_) | RxMode::Continuous => 0,
+            RxMode::DutyCycle(_) | RxMode::Continuous | RxMode::SingleMs(_) => 0,
             RxMode::Single(n) => n,
         };
         self.set_lora_symbol_num_timeout(num_symbols).await?;
@@ -628,6 +605,18 @@ where
                     Self::timeout_1(0),
                     Self::timeout_2(0),
                     Self::timeout_3(0),
+                ];
+                self.intf.write(&op, false).await
+            }
+            RxMode::SingleMs(ms) => {
+                // SetRx ticks are 15.625 us, 64 per millisecond; 0xffffff is
+                // the continuous sentinel, so saturate below it.
+                let ticks = (ms as u64 * 64).min(RX_CONTINUOUS_TIMEOUT as u64 - 1) as u32;
+                let op = [
+                    OpCode::SetRx.value(),
+                    Self::timeout_1(ticks),
+                    Self::timeout_2(ticks),
+                    Self::timeout_3(ticks),
                 ];
                 self.intf.write(&op, false).await
             }
@@ -898,8 +887,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     // -17 (0xEF) to +14 (0x0E) dBm by step of 1 dB if low power PA is selected
     // -9 (0xF7) to +22 (0x16) dBm by step of 1 dB if high power PA is selected
@@ -908,14 +895,5 @@ mod tests {
         assert_eq!(i32_val as u8, 0xefu8);
         i32_val = -9;
         assert_eq!(i32_val as u8, 0xf7u8);
-    }
-
-    #[test]
-    fn test_convert_sync_word() {
-        // sx126x 0x3444 corresponds to sx127 0x34
-        assert_eq!(convert_sync_word(0x34), [0x34, 0x44]);
-
-        // sx126x 0x1424 corresponds to sx127 0x12
-        assert_eq!(convert_sync_word(0x12), [0x14, 0x24]);
     }
 }

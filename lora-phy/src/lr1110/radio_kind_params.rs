@@ -419,6 +419,21 @@ impl FallbackMode {
     }
 }
 
+/// Mode the chip waits in between the two activities of AutoTxRx
+#[derive(Clone, Copy)]
+pub enum IntermediaryMode {
+    Sleep = 0x00,
+    StandbyRc = 0x01,
+    StandbyXosc = 0x02,
+    Fs = 0x03,
+}
+
+impl IntermediaryMode {
+    pub fn value(self) -> u8 {
+        self as u8
+    }
+}
+
 // =============================================================================
 // GFSK Types and Constants (from SWDR001 lr11xx_radio.c/h)
 // =============================================================================
@@ -709,12 +724,14 @@ pub struct SleepParams {
 
 impl SleepParams {
     pub fn value(self) -> u8 {
+        // LR11xx SetSleep config: bit 0 = warm start (retention), bit 1 =
+        // wake-up on RTC timeout — not the SX126x bit layout
         let mut val = 0u8;
         if self.warm_start {
-            val |= 0x04;
+            val |= 0x01;
         }
         if self.rtc_wakeup {
-            val |= 0x01;
+            val |= 0x02;
         }
         val
     }
@@ -1346,4 +1363,50 @@ pub fn delay_between_last_bit_sent_and_rx_done_in_us(spreading_factor: Spreading
 /// This timing is useful for precise transmit timing calculations.
 pub fn delay_between_last_bit_sent_and_tx_done_in_us(ramp_time: RampTime) -> u32 {
     ramp_time.to_us() + TX_DONE_IRQ_PROCESSING_TIME_IN_US
+}
+
+/// Parameters for SetDioAsRfSwitch command
+/// every field is a bitfield of the corresponding DIO
+/// bit 0 = rfsw0 (DIO5)
+/// bit 1 = rfsw1 (DIO6)
+/// bit 2 = rfsw2 (DIO7)
+/// bit 3 = rfsw3 (DIO8)
+/// bit 4 = rfsw4 (DIO10)
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
+pub struct SetDioAsRfSwitchParams {
+    /// indicates which switch is used
+    pub enable: u8,
+    /// DIO states when in standby mode
+    pub standby: u8,
+    /// DIO states when in rx mode
+    pub rx: u8,
+    /// DIO states when in low power tx mode
+    pub tx_lp: u8,
+    /// DIO states when in high power tx mode
+    pub tx_hp: u8,
+    /// DIO states when in 2.4 GHz tx mode
+    pub tx_hf: u8,
+    /// DIO states when in GNSS scanning mode
+    pub gnss: u8,
+    /// DIO states when in Wi-Fi scanning mode
+    pub wifi: u8,
+}
+
+impl Default for SetDioAsRfSwitchParams {
+    /// The default enables only DIO5 (bit 0), so the DIO6 bit set in
+    /// `tx_lp`/`tx_hp` is configured but never driven. Boards that switch TX
+    /// via DIO6 need to add bit 1 to `enable`.
+    fn default() -> Self {
+        Self {
+            enable: 0x01,
+            standby: 0x00,
+            rx: 0x01,
+            tx_lp: 0x02,
+            tx_hp: 0x02,
+            tx_hf: 0x00,
+            gnss: 0x00,
+            wifi: 0x00,
+        }
+    }
 }

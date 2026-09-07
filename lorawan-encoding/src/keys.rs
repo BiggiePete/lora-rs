@@ -1,6 +1,6 @@
 //! Implement types for dealing with LoRaWAN keys and required
 //! cryptography entities.
-use super::parser::{McAddr, EUI64};
+use super::parser::McAddr;
 
 macro_rules! lorawan_key {
     (
@@ -91,30 +91,24 @@ lorawan_key!(
 /// It is NOT REQUIRED for ABP-only end-devices.
 impl McKey {
     /// McAppSKey = aes128_encrypt(McKey, 0x01 | McAddr | pad16)
-    pub fn derive_mc_app_s_key<F: CryptoFactory, T: AsRef<[u8]>>(
-        &self,
-        crypto: &F,
-        mc_addr: &McAddr<T>,
-    ) -> McAppSKey {
-        let aes_enc = crypto.new_enc(&self.0);
+    ///
+    /// `crypto` must be bound to the McKey.
+    pub fn derive_mc_app_s_key<C: Crypto>(crypto: &C, mc_addr: &McAddr) -> McAppSKey {
         let mut bytes: [u8; 16] = [0; 16];
         bytes[0] = 0x01;
-        bytes[1..5].copy_from_slice(mc_addr.as_ref());
-        aes_enc.encrypt_block(&mut bytes);
+        bytes[1..5].copy_from_slice(mc_addr.as_wire_bytes());
+        crypto.encrypt_block(&mut bytes);
         McAppSKey::from(bytes)
     }
 
     /// McNetSKey = aes128_encrypt(McKey, 0x02 | McAddr | pad16)
-    pub fn derive_mc_net_s_key<F: CryptoFactory, T: AsRef<[u8]>>(
-        &self,
-        crypto: &F,
-        mc_addr: &McAddr<T>,
-    ) -> McNetSKey {
-        let aes_enc = crypto.new_enc(&self.0);
+    ///
+    /// `crypto` must be bound to the McKey.
+    pub fn derive_mc_net_s_key<C: Crypto>(crypto: &C, mc_addr: &McAddr) -> McNetSKey {
         let mut bytes: [u8; 16] = [0; 16];
         bytes[0] = 0x02;
-        bytes[1..5].copy_from_slice(mc_addr.as_ref());
-        aes_enc.encrypt_block(&mut bytes);
+        bytes[1..5].copy_from_slice(mc_addr.as_wire_bytes());
+        crypto.encrypt_block(&mut bytes);
         McNetSKey::from(bytes)
     }
 }
@@ -165,29 +159,32 @@ lorawan_key!(
 
 impl McKEKey {
     /// McKEKey = aes128_encrypt(McRootKey, 0x00 | pad16)
-    pub fn derive_from<F: CryptoFactory>(crypto: &F, root_key: &McRootKey) -> Self {
-        let aes_enc = crypto.new_enc(&root_key.0);
+    ///
+    /// `crypto` must be bound to the McRootKey.
+    pub fn derive_from<C: Crypto>(crypto: &C) -> Self {
         let mut bytes: [u8; 16] = [0; 16];
-        aes_enc.encrypt_block(&mut bytes);
+        crypto.encrypt_block(&mut bytes);
         McKEKey::from(bytes)
     }
 }
 
 impl McRootKey {
     /// LoRaWAN 1.1.x: McRootKey = aes128_encrypt(AppKey, 0x20 | pad16)
-    pub fn derive_from_app_key<F: CryptoFactory>(crypto: &F, app_key: &AppKey) -> Self {
-        let aes_enc = crypto.new_enc(&app_key.0);
+    ///
+    /// `crypto` must be bound to the AppKey.
+    pub fn derive_from_app_key<C: Crypto>(crypto: &C) -> Self {
         let mut bytes: [u8; 16] = [0; 16];
         bytes[0] = 0x20;
-        aes_enc.encrypt_block(&mut bytes);
+        crypto.encrypt_block(&mut bytes);
         McRootKey::from(bytes)
     }
 
     /// LoRaWAN 1.0.x: McRootKey = aes128_encrypt(GenAppKey, 0x00 | pad16)
-    pub fn derive_from_gen_app_key<F: CryptoFactory>(crypto: &F, app_key: &GenAppKey) -> Self {
-        let aes_enc = crypto.new_enc(&app_key.0);
+    ///
+    /// `crypto` must be bound to the GenAppKey.
+    pub fn derive_from_gen_app_key<C: Crypto>(crypto: &C) -> Self {
         let mut bytes: [u8; 16] = [0; 16];
-        aes_enc.encrypt_block(&mut bytes);
+        crypto.encrypt_block(&mut bytes);
         McRootKey::from(bytes)
     }
 }
@@ -195,18 +192,18 @@ impl McRootKey {
 macro_rules! lorawan_eui {
     (
         $(#[$outer:meta])*
-        pub struct $type:ident(EUI64<[u8; 8]>);
+        pub struct $type:ident([u8; 8]);
     ) => {
         $(#[$outer])*
         #[doc = concat!(
             "# Usage\n\n",
-            "## Creating from a hex-encoded LSB string:\n",
+            "## Creating from a human-readable, MSB-first hex string:\n",
             "```\n",
             "use lorawan::keys::", stringify!($type), ";\n",
             "use core::str::FromStr;\n",
             "let eui = ", stringify!($type), "::from_str(\"0011223344556677\").unwrap();\n",
             "```\n\n",
-            "## Creating from a byte array in LSB format:\n",
+            "## Creating from a byte array in LoRaWAN wire order (LSB first):\n",
             "```\n",
             "use lorawan::keys::", stringify!($type), ";\n",
             "let eui = ", stringify!($type), "::from([\n",
@@ -217,7 +214,7 @@ macro_rules! lorawan_eui {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
         #[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
-        pub struct $type(EUI64<[u8; 8]>);
+        pub struct $type([u8; 8]);
 
         impl $type {
             pub const fn byte_len() -> usize {
@@ -227,11 +224,11 @@ macro_rules! lorawan_eui {
 
         impl From<[u8;8]> for $type {
             fn from(key: [u8; 8]) -> Self {
-                $type(EUI64::from(key))
+                $type(key)
             }
         }
 
-        impl From<$type> for EUI64<[u8; 8]> {
+        impl From<$type> for [u8; 8] {
             fn from(key: $type) -> Self {
                 key.0
             }
@@ -239,7 +236,7 @@ macro_rules! lorawan_eui {
 
         impl AsRef<[u8]> for $type {
             fn as_ref(&self) -> &[u8] {
-                &self.0.as_ref()
+                &self.0
             }
         }
     };
@@ -255,7 +252,7 @@ lorawan_eui!(
     /// It is a recommended practice that `DevEui` should also be available on
     /// an end-device label for the purpose of end-device administration.
     ///
-    pub struct DevEui(EUI64<[u8; 8]>);
+    pub struct DevEui([u8; 8]);
 );
 lorawan_eui!(
     /// The [`AppEui`] is a global application ID in IEEE EUI64 address space
@@ -268,7 +265,7 @@ lorawan_eui!(
     ///
     /// As of LoRaWAN 1.0.4, `AppEui` is called `JoinEui`.
     ///
-    pub struct AppEui(EUI64<[u8; 8]>);
+    pub struct AppEui([u8; 8]);
 );
 
 /// [`AES128`] represents 128-bit AES key.
@@ -294,45 +291,50 @@ impl From<[u8; 4]> for MIC {
     }
 }
 
-/// Trait for implementations of AES128 encryption.
-pub trait Encrypter {
-    fn encrypt_block(&self, block: &mut [u8]);
-}
-
-/// Trait for implementations of AES128 decryption.
-pub trait Decrypter {
-    fn decrypt_block(&self, block: &mut [u8]);
-}
-
-/// Trait for implementations of CMAC (RFC4493).
-pub trait Mac {
-    fn input(&mut self, data: &[u8]);
-    fn reset(&mut self);
-    fn result(self) -> [u8; 16];
-}
-
-/// Represents an abstraction over the crypto functions.
+/// AES-128 crypto primitives bound to a single key.
 ///
-/// This trait provides a way to pick a different implementation of the crypto primitives.
-pub trait CryptoFactory {
-    type E: Encrypter;
-    type D: Decrypter;
-    type M: Mac;
+/// The key is provided when the implementation is constructed. Whether the
+/// implementation caches the expanded AES key schedule (trading RAM for less
+/// work per operation) or recomputes it per call is the implementation's
+/// choice; [`crate::default_crypto::DefaultCrypto`] caches it.
+///
+/// A LoRaWAN device only ever needs the AES encrypt primitive: FRMPayload
+/// "decryption" is AES-CTR keystream generation using encrypt, and JoinAccept
+/// decryption is specified as an encrypt operation on the device side.
+/// Implementations backed by encrypt-only hardware can therefore implement
+/// this trait fully. The AES decrypt primitive is only needed by network-side
+/// payload creation; see [`NetworkCrypto`].
+pub trait Crypto {
+    /// Encrypts a single 16-byte block in place (AES-128 ECB).
+    ///
+    /// `block` must be exactly 16 bytes.
+    fn encrypt_block(&self, block: &mut [u8]);
 
-    /// Method that creates an Encrypter.
-    fn new_enc(&self, key: &AES128) -> Self::E;
+    /// Computes the AES-CMAC (RFC 4493) over `b0` followed by `data` and
+    /// returns the first four bytes, which form the LoRaWAN MIC.
+    ///
+    /// `b0` is the block B0 prepended for data payloads; it is empty for join
+    /// messages.
+    fn calculate_mic(&self, b0: &[u8], data: &[u8]) -> [u8; 4];
+}
 
-    /// Method that creates a Decrypter.
-    fn new_dec(&self, key: &AES128) -> Self::D;
-
-    /// Method that creates a MAC calculator.
-    fn new_mac(&self, key: &AES128) -> Self::M;
+/// Network-side AES-128 crypto: everything a device needs plus the AES
+/// decrypt primitive.
+///
+/// Only payload creation performed by a network needs decrypt: JoinAccept
+/// creation and multicast McGroupSetupReq creation. Device-side code never
+/// requires this trait.
+pub trait NetworkCrypto: Crypto {
+    /// Decrypts a single 16-byte block in place (AES-128 ECB).
+    ///
+    /// `block` must be exactly 16 bytes.
+    fn decrypt_block(&self, block: &mut [u8]);
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::default_crypto::DefaultFactory;
+    use crate::default_crypto::DefaultCrypto;
 
     const TEST_KEY: [u8; 16] = [4, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
@@ -340,7 +342,7 @@ mod test {
     #[test]
     fn mc_root_key_to_mc_ke_key() {
         let mc_root_key = McRootKey::from(TEST_KEY);
-        let mc_ke_key = McKEKey::derive_from(&DefaultFactory, &mc_root_key);
+        let mc_ke_key = McKEKey::derive_from(&DefaultCrypto::new(mc_root_key.inner()));
         assert_eq!(
             McKEKey(AES128([
                 0x90, 0x83, 0xbe, 0xbf, 0x70, 0x42, 0x57, 0x88, 0x31, 0x60, 0xdb, 0xfc, 0xde, 0x33,
@@ -353,7 +355,10 @@ mod test {
     #[test]
     fn mc_key_to_mc_app_s_key() {
         let mc_key = McKey::from(TEST_KEY);
-        let mc_app_s_key = mc_key.derive_mc_app_s_key(&DefaultFactory, &McAddr::from(ADDR));
+        let mc_app_s_key = McKey::derive_mc_app_s_key(
+            &DefaultCrypto::new(mc_key.inner()),
+            &McAddr::from_wire_bytes(ADDR),
+        );
         assert_eq!(
             McAppSKey(AES128([
                 0x50, 0xDF, 0x70, 0x27, 0xEF, 0xC6, 0xB4, 0x7D, 0xA8, 0x10, 0xEE, 0x3C, 0xCA, 0x0D,
@@ -366,7 +371,10 @@ mod test {
     #[test]
     fn mc_key_to_mc_net_s_key() {
         let mc_key = McKey::from(TEST_KEY);
-        let mc_net_s_key = mc_key.derive_mc_net_s_key(&DefaultFactory, &McAddr::from(ADDR));
+        let mc_net_s_key = McKey::derive_mc_net_s_key(
+            &DefaultCrypto::new(mc_key.inner()),
+            &McAddr::from_wire_bytes(ADDR),
+        );
         assert_eq!(
             McNetSKey(AES128([
                 0x8D, 0xF7, 0x07, 0x27, 0x36, 0x47, 0xE2, 0x2E, 0x4E, 0x27, 0xFE, 0x00, 0x4B, 0x99,

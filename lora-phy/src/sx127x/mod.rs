@@ -3,6 +3,8 @@ mod sx1272;
 pub use sx1272::Sx1272;
 mod sx1276;
 pub use sx1276::Sx1276;
+#[cfg(test)]
+mod test;
 
 use embedded_hal_async::delay::DelayNs;
 use embedded_hal_async::spi::*;
@@ -25,20 +27,16 @@ const SX1276_RSSI_OFFSET_LF: i16 = -164;
 const SX1276_RSSI_OFFSET_HF: i16 = -157;
 const SX1276_RF_MID_BAND_THRESH: u32 = 525_000_000;
 
-// Frequency synthesizer step for frequency calculation (Hz)
-// FXOSC (32 MHz) * 1000000 (Hz/MHz) / 524288 (2^19)
-const SCALE: u32 = 8;
-const STEP_SCALED: u32 = 32_000_000 >> (19 - SCALE);
-
+// Frequency synthesizer step: FXOSC (32 MHz) / 524288 (2^19) = 61.03515625 Hz
 fn freq_to_pll_step(freq_in_hz: u32) -> u32 {
-    // We can use simplified integer formula which gives the same
-    // value for whole and half Mhz values ((i.e. 868.0, 868.5, 869, ...)
-    // `(freq_in_hz as f64 / 61.03515625) as u32`
-    (freq_in_hz / STEP_SCALED) << SCALE
+    // Full-precision integer form of freq / 61.03515625. The previous
+    // truncate-then-shift shortcut zeroed the low 8 pll-step bits, putting
+    // fractional-MHz channels (868.1, 903.9, ...) up to ~15 kHz off.
+    (((freq_in_hz as u64) << 19) / 32_000_000) as u32
 }
 
 fn pll_step_to_freq(pll_step: u32) -> u32 {
-    (pll_step >> SCALE) * STEP_SCALED
+    (((pll_step as u64) * 32_000_000) >> 19) as u32
 }
 
 // RSSI requires linearization when SNR >= 0
@@ -124,6 +122,16 @@ where
     async fn set_ocp(&mut self, ocp_trim: OcpTrim) -> Result<(), RadioError> {
         self.write_register(Register::RegOcp, ocp_trim.value()).await
     }
+
+    #[cfg(test)]
+    fn take_spi(self) -> SPI {
+        self.intf.spi
+    }
+
+    #[cfg(test)]
+    fn spi_mut(&mut self) -> &mut SPI {
+        &mut self.intf.spi
+    }
 }
 
 impl<SPI, IV, C> RadioKind for Sx127x<SPI, IV, C>
@@ -132,7 +140,17 @@ where
     IV: InterfaceVariant,
     C: Sx127xVariant,
 {
-    async fn init_lora(&mut self, sync_word: u8) -> Result<(), RadioError> {
+    // The sx127x drives its single-receive timeout off SymbTimeout, which
+    // needs headroom over the 8-symbol LoRaWAN preamble to latch reliably; 6
+    // (the trait default) is too short and drops downlinks at higher rates.
+    const DEFAULT_MIN_RX_SYMBOLS: u16 = 8;
+
+    // RegSymbTimeout is 10 bits and there is no wall-clock RX timer to fall
+    // back on, so longer windows clamp (SUPPORTS_TIMED_SINGLE_RX stays false).
+    const MAX_SINGLE_RX_SYMBOLS: u16 = SX127X_MAX_LORA_SYMB_NUM_TIMEOUT;
+
+    async fn init_lora(&mut self, sync_word: u16) -> Result<(), RadioError> {
+        let sync_word = sync_word_to_legacy(sync_word)?;
         if self.config.tcxo_used {
             self.write_register(C::reg_txco(), TCXO_FOR_OSCILLATOR).await?;
         }
@@ -144,6 +162,11 @@ where
         C::init_lora(self, sync_word).await?;
 
         Ok(())
+    }
+
+    async fn set_lora_sync_word(&mut self, sync_word: u16) -> Result<(), RadioError> {
+        let sync_word = sync_word_to_legacy(sync_word)?;
+        self.write_register(Register::RegSyncWord, sync_word).await
     }
 
     fn create_modulation_params(
@@ -279,8 +302,8 @@ where
             _ => (0x03, 0x0a),
         };
         let reg_val = self.read_register(Register::RegDetectionOptimize).await?;
-        // Keep reserved bits [6:3] for RegDetectOptimize
-        let val = (reg_val & 0b0111_1000) | opt;
+        // Keep AutomaticIFOn [7] (errata 2.3) and reserved bits [6:3]
+        let val = (reg_val & 0b1111_1000) | opt;
         self.write_register(Register::RegDetectionOptimize, val).await?;
         self.write_register(Register::RegDetectionThreshold, thr).await?;
         // Spreading Factor, Bandwidth, codingrate, ldro
@@ -358,6 +381,7 @@ where
         let (num_symbols, mode) = match rx_mode {
             RxMode::DutyCycle(_) => Err(RadioError::DutyCycleUnsupported),
             RxMode::Single(ns) => Ok((ns.max(SX127X_MIN_LORA_SYMB_NUM_TIMEOUT), LoRaMode::RxSingle)),
+            RxMode::SingleMs(_) => Err(RadioError::TimedSingleRxUnsupported),
             RxMode::Continuous => Ok((0, LoRaMode::RxContinuous)),
         }?;
 
@@ -373,6 +397,12 @@ where
         self.write_register(Register::RegLna, lna_gain).await?;
 
         self.write_register(Register::RegFifoAddrPtr, 0x00u8).await?;
+
+        // Interrupt flags stay latched until the host clears them by writing a 1
+        // (SX1276 DS §4.1.2.4); entering Rx does not reset them. Clear here so a
+        // flag left over from an earlier operation can't read as a result of this
+        // one; this also covers listen(), which never calls set_irq_params.
+        self.clear_irq_status().await?;
 
         self.write_register(Register::RegOpMode, mode.value()).await
     }
@@ -413,10 +443,13 @@ where
 
             let rssi_offset = C::rssi_offset(self).await?;
 
+            // Section 5.5.5: the 16/15 linearization applies to the raw
+            // packet RSSI in both branches (the reference driver and
+            // LoRaMac-node agree; only the negative-SNR term differs)
             if snr >= 0 {
                 rssi_offset + linearize_rssi(packet_rssi)
             } else {
-                rssi_offset + (packet_rssi as i16) + snr
+                rssi_offset + linearize_rssi(packet_rssi) + snr
             }
         };
 
@@ -445,6 +478,13 @@ where
     // enable interrupts on DIO pins (sx127x has multiple),
     // and allow interrupts.
     async fn set_irq_params(&mut self, radio_mode: Option<RadioMode>) -> Result<(), RadioError> {
+        // Interrupt flags stay latched until the host clears them by writing a 1
+        // (SX1276 DS §4.1.2.4); mode changes do not reset them. Clear before the
+        // DIO remap so a leftover flag can't sit on a freshly mapped DIO line,
+        // where the MCU's edge-triggered interrupt would either fire on the stale
+        // flag or never see an edge for the next real one.
+        self.clear_irq_status().await?;
+
         match radio_mode {
             Some(RadioMode::Transmit) => {
                 self.write_register(
@@ -502,9 +542,6 @@ where
             }
         }
 
-        // clear all active IRQ flags
-        self.write_register(Register::RegIrqFlags, 0xffu8).await?;
-
         Ok(())
     }
 
@@ -525,7 +562,7 @@ where
                     return Ok(Some(IrqState::Done));
                 }
             }
-            RadioMode::Receive(RxMode::Continuous) | RadioMode::Receive(RxMode::Single(_)) => {
+            RadioMode::Receive(RxMode::Continuous | RxMode::Single(_) | RxMode::SingleMs(_)) => {
                 if (irq_flags & IrqMask::RxDone.value()) == IrqMask::RxDone.value() {
                     debug!("RxDone in radio mode {}", radio_mode);
                     return Ok(Some(IrqState::Done));

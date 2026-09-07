@@ -1,19 +1,19 @@
+use crate::Downlink;
 use crate::mac::FcntDown;
 use crate::radio::RadioBuffer;
-use crate::Downlink;
 use crate::{async_device, mac};
 use core::fmt::Debug;
 use core::ops::RangeInclusive;
-use lorawan::default_crypto::DefaultFactory;
+use lorawan::default_crypto::DefaultCrypto;
 use lorawan::keys::McKEKey;
+use lorawan::multicast::parse_downlink_multicast_commands;
 pub use lorawan::multicast::{self, Session};
 use lorawan::multicast::{
-    parse_downlink_multicast_messages, DownlinkRemoteSetup, McGroupDeleteAnsCreator,
-    McGroupSetupAnsCreator, McGroupStatusAnsCreator, PackageVersionAnsCreator,
+    DownlinkRemoteSetup, McGroupDeleteAnsCreator, McGroupSetupAnsCreator, McGroupStatusAnsCreator,
+    PackageVersionAnsCreator,
 };
-use lorawan::parser::FRMPayload;
 pub use lorawan::parser::McAddr;
-use lorawan::parser::{DataHeader, EncryptedDataPayload};
+use lorawan::parser::{DecryptedDataPayload, EncryptedDataPayload, FrmPayload};
 
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
@@ -65,30 +65,34 @@ impl Multicast {
     pub(crate) fn handle_rx<const D: usize>(
         &mut self,
         dl: &mut heapless::Vec<Downlink, D>,
-        encrypted_data: EncryptedDataPayload<&mut [u8]>,
+        bytes: &mut [u8],
     ) -> Response {
+        let Ok(encrypted_data) = EncryptedDataPayload::parse(bytes) else {
+            return Response::NoUpdate;
+        };
         let mc_addr = encrypted_data.fhdr().mc_addr();
         if let Some((group_id, session)) = self.matching_session(mc_addr) {
             let fcnt = encrypted_data.fhdr().fcnt() as u32;
-            if encrypted_data.validate_mic(session.mc_net_s_key().inner(), fcnt, &DefaultFactory)
+            let nwk_crypto = DefaultCrypto::new(session.mc_net_s_key().inner());
+            let app_crypto = DefaultCrypto::new(session.mc_app_s_key().inner());
+            if encrypted_data.validate_mic(&nwk_crypto, fcnt)
                 && (fcnt > session.fcnt_down || fcnt == 0)
             {
                 return {
                     session.fcnt_down = fcnt;
                     // We can safely unwrap here because we already validated the MIC
-                    let decrypted = encrypted_data
-                        .decrypt(
-                            Some(session.mc_net_s_key().inner()),
-                            Some(session.mc_app_s_key().inner()),
-                            session.fcnt_down,
-                            &DefaultFactory,
-                        )
-                        .unwrap();
+                    let decrypted = DecryptedDataPayload::decrypt_in_place(
+                        bytes,
+                        Some(&nwk_crypto),
+                        Some(&app_crypto),
+                        session.fcnt_down,
+                    )
+                    .unwrap();
                     if session.fcnt_down == session.max_fcnt_down() {
                         // if the FCnt is used up, the session has expired
                         Response::SessionExpired { group_id }
                     } else {
-                        if let (Some(fport), FRMPayload::Data(data)) =
+                        if let (Some(fport), FrmPayload::Data(data)) =
                             (decrypted.f_port(), decrypted.frm_payload())
                         {
                             // heapless Vec from slice fails only if slice is too large.
@@ -130,14 +134,16 @@ impl Multicast {
             return Response::NoUpdate;
         }
         let mc_k_e_key = self.mc_k_e_key.as_ref().unwrap();
-        let messages = parse_downlink_multicast_messages(data);
+        let messages = parse_downlink_multicast_commands(data);
         let mut new_session = None;
         for message in messages {
+            let Ok(message) = message else {
+                break;
+            };
             match message {
                 DownlinkRemoteSetup::McGroupSetupReq(mc_group_setup_req) => {
-                    let crypto = DefaultFactory;
-                    let (group_id, session) =
-                        mc_group_setup_req.derive_session(&crypto, mc_k_e_key);
+                    let crypto = DefaultCrypto::new(mc_k_e_key.inner());
+                    let (group_id, session) = mc_group_setup_req.derive_session(&crypto);
                     self.sessions[group_id as usize] = Some(session);
                     let mut ans = McGroupSetupAnsCreator::new();
                     ans.mc_group_id_header(group_id);
@@ -201,6 +207,8 @@ impl Multicast {
         &mut self,
         mut state: &mut mac::State,
         buf: &mut RadioBuffer<N>,
+        configuration: &mac::Configuration,
+        region: &crate::region::Configuration,
     ) -> mac::Result<mac::FcntUp> {
         let send_data = mac::SendData {
             fport: self.remote_setup_port,
@@ -208,8 +216,8 @@ impl Multicast {
             confirmed: false,
         };
         match &mut state {
-            mac::State::Joined(ref mut session) => {
-                let response = session.prepare_buffer::<N>(&send_data, buf);
+            mac::State::Joined(session) => {
+                let response = session.prepare_buffer::<N>(&send_data, buf, configuration, region);
                 self.pending_uplinks.clear();
                 Ok(response)
             }
@@ -220,13 +228,13 @@ impl Multicast {
 
     pub(crate) fn matching_session(
         &mut self,
-        multicast_addr: McAddr<&[u8]>,
+        multicast_addr: McAddr,
     ) -> Option<(u8, &mut Session)> {
         self.sessions.iter_mut().enumerate().find_map(|(group_id, s)| {
-            if let Some(s) = s {
-                if s.multicast_addr() == multicast_addr {
-                    return Some((group_id as u8, s));
-                }
+            if let Some(s) = s
+                && s.multicast_addr() == multicast_addr
+            {
+                return Some((group_id as u8, s));
             }
             None
         })

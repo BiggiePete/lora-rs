@@ -40,7 +40,6 @@ impl From<Subband> for usize {
 
 #[derive(Clone)]
 pub(crate) struct FixedChannelPlan<F: FixedChannelRegion> {
-    last_tx_channel: u8,
     channel_mask: ChannelMask<9>,
     _fixed_channel_region: PhantomData<F>,
     join_channels: JoinChannels,
@@ -51,7 +50,6 @@ pub(crate) struct FixedChannelPlan<F: FixedChannelRegion> {
 impl<F: FixedChannelRegion> FixedChannelPlan<F> {
     pub fn new(freq_fn: fn(u32) -> bool) -> Self {
         Self {
-            last_tx_channel: Default::default(),
             channel_mask: Default::default(),
             _fixed_channel_region: Default::default(),
             join_channels: Default::default(),
@@ -91,17 +89,15 @@ impl<F: FixedChannelRegion> FixedChannelPlan<F> {
 }
 
 pub(crate) trait FixedChannelRegion: ChannelRegion {
-    const MAX_RX1_DR_OFFSET: u8;
     fn uplink_channels() -> &'static [u32; 72];
     fn downlink_channels() -> &'static [u32; 8];
-    fn default_rx2_freq() -> u32;
     fn get_rx_datarate(tx_dr: DR, rx1_dr_offset: u8, window: &Window) -> DR;
 }
 
 impl<F: FixedChannelRegion> RegionHandler for FixedChannelPlan<F> {
-    fn process_join_accept<T: AsRef<[u8]>>(&mut self, join_accept: &DecryptedJoinAcceptPayload<T>) {
-        if let Some(CfList::FixedChannel(channel_mask)) = join_accept.c_f_list() {
-            self.channel_mask_set(channel_mask);
+    fn process_join_accept(&mut self, c_f_list: Option<&CfList>) {
+        if let Some(CfList::FixedChannel(channel_mask)) = c_f_list {
+            self.channel_mask_set(channel_mask.clone());
         }
     }
 
@@ -127,17 +123,19 @@ impl<F: FixedChannelRegion> RegionHandler for FixedChannelPlan<F> {
                 channel_mask.set_bank(base_index + 1, ch_mask.get_index(1));
             }
             5 => {
-                let ch_mask: u16 =
-                    ch_mask.get_index(0) as u16 | ((ch_mask.get_index(1) as u16) << 8);
-                channel_mask.set_bank(0, ((ch_mask & 0b1) * 0xFF) as u8);
-                channel_mask.set_bank(1, ((ch_mask & 0b10) * 0xFF) as u8);
-                channel_mask.set_bank(2, ((ch_mask & 0b100) * 0xFF) as u8);
-                channel_mask.set_bank(3, ((ch_mask & 0b1000) * 0xFF) as u8);
-                channel_mask.set_bank(4, ((ch_mask & 0b10000) * 0xFF) as u8);
-                channel_mask.set_bank(5, ((ch_mask & 0b100000) * 0xFF) as u8);
-                channel_mask.set_bank(6, ((ch_mask & 0b1000000) * 0xFF) as u8);
-                channel_mask.set_bank(7, ((ch_mask & 0b10000000) * 0xFF) as u8);
-                channel_mask.set_bank(8, ((ch_mask & 0b100000000) * 0xFF) as u8);
+                // Each of the 8 LSBs controls a bank of 8 125 kHz channels plus the
+                // paired 500 kHz channel: bit i -> channels [8i, 8i+7] and 64+i.
+                // The 8 MSBs are RFU. (RP002 2.5.5, Table 19)
+                let blocks = ch_mask.get_index(0);
+                for i in 0..8 {
+                    let bank = if blocks & (1 << i) != 0 {
+                        0xFF
+                    } else {
+                        0x00
+                    };
+                    channel_mask.set_bank(i, bank);
+                }
+                channel_mask.set_bank(8, blocks);
             }
             6 => {
                 self.set_125k_channels(channel_mask, true, ch_mask);
@@ -154,18 +152,17 @@ impl<F: FixedChannelRegion> RegionHandler for FixedChannelPlan<F> {
     }
 
     fn channel_mask_validate(&self, channel_mask: &ChannelMask<9>, dr: Option<DR>) -> bool {
-        if let Some(dr) = dr {
-            if let Some(dr) = &F::datarates()[dr as usize] {
-                return match dr.bandwidth {
-                    Bandwidth::_500KHz => (64..=71).any(|i| channel_mask.is_enabled(i).unwrap()),
-                    Bandwidth::_125KHz => {
-                        // Check that at least two channels are enabled
-                        (0..64).filter(|&i| channel_mask.is_enabled(i).unwrap()).take(2).count()
-                            == 2
-                    }
-                    _ => true,
-                };
-            }
+        if let Some(dr) = dr
+            && let Some(dr) = &F::datarates()[dr as usize]
+        {
+            return match dr.bandwidth {
+                Bandwidth::_500KHz => (64..=71).any(|i| channel_mask.is_enabled(i).unwrap()),
+                Bandwidth::_125KHz => {
+                    // Check that at least two channels are enabled
+                    (0..64).filter(|&i| channel_mask.is_enabled(i).unwrap()).take(2).count() == 2
+                }
+                _ => true,
+            };
         }
         false
     }
@@ -174,13 +171,13 @@ impl<F: FixedChannelRegion> RegionHandler for FixedChannelPlan<F> {
         F::datarates()[dr as usize].as_ref()
     }
 
-    fn get_tx_dr_and_frequency<RNG: RngCore>(
+    fn select_tx_channel<RNG: RngCore>(
         &mut self,
         rng: &mut RNG,
         datarate: DR,
         frame: &Frame,
-    ) -> (Datarate, u32) {
-        match frame {
+    ) -> TxChannel {
+        let (dr, channel) = match frame {
             Frame::Join => {
                 let channel = self.join_channels.get_next_channel(rng);
                 let dr = if channel < 64 {
@@ -188,33 +185,31 @@ impl<F: FixedChannelRegion> RegionHandler for FixedChannelPlan<F> {
                 } else {
                     DR::_4
                 };
-                self.last_tx_channel = channel;
-                let data_rate = F::datarates()[dr as usize].clone().unwrap();
-                (data_rate, F::uplink_channels()[channel as usize])
+                (dr, channel)
             }
             Frame::Data => {
                 // The join bias gets reset after receiving CFList in Join Frame
                 // or ChannelMask in the LinkADRReq in Data Frame.
                 // If it has not been reset yet, we continue to use the bias for the data frames.
                 // We hope to acquire ChannelMask via LinkADRReq.
-                let (data_rate, channel) = if self.join_channels.has_bias_and_not_exhausted() {
+                if self.join_channels.has_bias_and_not_exhausted() {
                     let channel = self.join_channels.get_next_channel(rng);
                     let dr = if channel < 64 {
                         DR::_0
                     } else {
                         DR::_4
                     };
-                    (F::datarates()[dr as usize].clone().unwrap(), channel)
+                    (dr, channel)
                 // Alternatively, we will ask JoinChannel logic to determine a channel from the
                 // subband that  the join succeeded on.
                 } else if let Some(channel) = self.join_channels.first_data_channel(rng) {
-                    (F::datarates()[datarate as usize].clone().unwrap(), channel)
+                    (datarate, channel)
                 } else {
                     // For the data frame, the datarate impacts which channel sets we can choose
                     // from. If the datarate bandwidth is 500 kHz, we must use
                     // channels 64..=71. Else, we must use 0-63
-                    let datarate = F::datarates()[datarate as usize].clone().unwrap();
-                    if datarate.bandwidth == Bandwidth::_500KHz {
+                    let bandwidth = F::datarates()[datarate as usize].as_ref().unwrap().bandwidth;
+                    if bandwidth == Bandwidth::_500KHz {
                         let mut channel = (rng.next_u32() & 0b111) as u8;
                         // keep selecting a random channel until we find one that is enabled
                         while !self.channel_mask.is_enabled((channel + 64).into()).unwrap() {
@@ -229,19 +224,19 @@ impl<F: FixedChannelRegion> RegionHandler for FixedChannelPlan<F> {
                         }
                         (datarate, channel)
                     }
-                };
-                self.last_tx_channel = channel;
-                (data_rate, F::uplink_channels()[channel as usize])
+                }
             }
+        };
+        TxChannel {
+            datarate: F::datarates()[dr as usize].clone().unwrap(),
+            dr,
+            frequency: F::uplink_channels()[channel as usize],
+            rx1_frequency: F::downlink_channels()[(channel % 8) as usize],
         }
     }
 
-    fn get_rx_frequency(&self, _frame: &Frame, window: &Window) -> u32 {
-        let channel = self.last_tx_channel % 8;
-        match window {
-            Window::_1 => F::downlink_channels()[channel as usize],
-            Window::_2 => F::default_rx2_freq(),
-        }
+    fn get_rx2_frequency(&self) -> u32 {
+        F::DEFAULT_RX2_FREQ
     }
 
     fn get_rx_datarate(&self, tx_dr: DR, rx1_dr_offset: u8, window: &Window) -> DR {

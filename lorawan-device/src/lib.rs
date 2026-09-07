@@ -29,7 +29,7 @@ pub mod nb_device;
 use nb_device::state::State;
 
 pub use lorawan::{
-    keys::{AppEui, AppKey, AppSKey, CryptoFactory, DevEui, NwkSKey},
+    keys::{AppEui, AppKey, AppSKey, Crypto, DevEui, NwkSKey},
     parser::DevAddr,
 };
 
@@ -74,5 +74,5 @@ pub trait Timings {
 /// Join the network using either OTAA or ABP.
 pub enum JoinMode {
     OTAA { deveui: DevEui, appeui: AppEui, appkey: AppKey },
-    ABP { nwkskey: NwkSKey, appskey: AppSKey, devaddr: DevAddr<[u8; 4]> },
+    ABP { nwkskey: NwkSKey, appskey: AppSKey, devaddr: DevAddr },
 }

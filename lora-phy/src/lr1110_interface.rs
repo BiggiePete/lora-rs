@@ -31,6 +31,9 @@ where
 
     // Write a buffer to the radio.
     pub async fn write(&mut self, write_buffer: &[u8], is_sleep_command: bool) -> Result<(), RadioError> {
+        // Guard: wait for BUSY to be LOW before asserting NSS
+        self.iv.wait_on_busy().await?;
+
         self.spi.write(write_buffer).await.map_err(|_| SPI)?;
         trace!("write: {=[u8]:02x}", write_buffer);
 
@@ -68,25 +71,41 @@ where
     pub async fn read(&mut self, write_buffer: &[u8], read_buffer: &mut [u8]) -> Result<(), RadioError> {
         // Step 1: Write command in separate transaction
         if !write_buffer.is_empty() {
+            // Guard: wait for BUSY to be LOW before asserting NSS. If the
+            // previous transaction's BUSY de-assertion glitches or the GPIOTE
+            // edge-detection in wait_for_low returns early, writing a new
+            // command while BUSY is still asserted will corrupt the response.
+            self.iv.wait_on_busy().await?;
+
             self.spi.write(write_buffer).await.map_err(|_| SPI)?;
         }
 
-        // Step 2: Wait for BUSY to go low
+        // Step 2: Wait for BUSY to go low (post-command processing)
         self.iv.wait_on_busy().await?;
 
         // Step 3: Read response in separate transaction
-        // First byte is Stat1 (discarded), followed by actual data
-        // Read stat1 and data in a single SPI transaction using transfer
+        // First byte is Stat1, followed by actual data.
         let mut stat1 = [0u8; 1];
         let mut ops = [Operation::Read(&mut stat1), Operation::Read(read_buffer)];
         self.spi.transaction(&mut ops).await.map_err(|_| SPI)?;
 
         trace!(
-            "read: addr={=[u8]:02x}, len={}, data={=[u8]:02x}",
+            "read: addr={=[u8]:02x}, len={}, stat1={:02x}, data={=[u8]:02x}",
             write_buffer,
             read_buffer.len(),
+            stat1[0],
             read_buffer
         );
+
+        // Stat1 bits[3:1] encode the command status:
+        //   0 = CMD_FAIL  (command could not be executed)
+        //   1 = CMD_PERR  (wrong opcode or arguments)
+        //   2 = CMD_OK    (success)
+        //   3 = CMD_DAT   (success, data available)
+        // Anything below CMD_OK means the response data is invalid.
+        if (stat1[0] >> 1) & 0x07 < 2 {
+            return Err(RadioError::OpError(stat1[0]));
+        }
 
         Ok(())
     }

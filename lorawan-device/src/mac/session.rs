@@ -1,20 +1,27 @@
 use super::{
+    FcntUp, Response, SendData,
     otaa::{DevNonce, NetworkCredentials},
-    uplink, FcntUp, Response, SendData,
+    uplink,
 };
 use crate::radio::RadioBuffer;
-use crate::{region, AppSKey, Downlink, NwkSKey};
+use crate::region::constants::{ADR_ACK_DELAY, ADR_ACK_LIMIT, MAX_FCNT_GAP};
+use crate::{AppSKey, Downlink, NwkSKey, region};
+use core::num::NonZeroU8;
 use heapless::Vec;
+use lorawan::creator::{DataFrame, Payload};
 use lorawan::maccommandcreator::{
     DevStatusAnsCreator, DlChannelAnsCreator, LinkADRAnsCreator, NewChannelAnsCreator,
     RXParamSetupAnsCreator, RXTimingSetupAnsCreator,
 };
-use lorawan::maccommands::{DownlinkMacCommand, MacCommandIterator};
+use lorawan::maccommands::DownlinkMacCommand;
+use lorawan::maccommands::{MacCommands, parse_downlink_mac_commands};
+use lorawan::parser::{
+    DataFrameType, DecryptedDataPayload, DecryptedJoinAcceptPayload, DevAddr, EncryptedDataPayload,
+    FrmPayload,
+};
 use lorawan::{
-    creator::DataPayloadCreator,
-    default_crypto::DefaultFactory,
+    default_crypto::DefaultCrypto,
     packet_length::phy::{MHDR_LEN, MIC_LEN},
-    parser::{parse as lorawan_parse, *},
     types::DR,
 };
 
@@ -29,13 +36,14 @@ pub struct Session {
     pub confirmed: bool,
     pub nwkskey: NwkSKey,
     pub appskey: AppSKey,
-    pub devaddr: DevAddr<[u8; 4]>,
+    pub devaddr: DevAddr,
     pub fcnt_up: u32,
-    pub fcnt_down: u32,
-    // TODO: ADR handling
-    #[cfg(feature = "certification")]
-    /// Whether to force ADR bit for subsequent frames
-    pub override_adr: bool,
+    /// Frame counter of the last accepted downlink, or `None` before the first
+    /// downlink of the session. Only the low 16 bits of the counter are on the
+    /// wire; the high 16 bits kept here are used to rebuild the full value.
+    fcnt_down: Option<u32>,
+    /// Uplinks since the last accepted downlink; used for ADRACKReq / ADR backoff.
+    pub(crate) adr_ack_cnt: u32,
     #[cfg(feature = "certification")]
     /// Whether to override confirmation bit for sent frames
     pub override_confirmed: Option<bool>,
@@ -49,7 +57,7 @@ pub struct Session {
 pub struct SessionKeys {
     pub nwkskey: NwkSKey,
     pub appskey: AppSKey,
-    pub devaddr: DevAddr<[u8; 4]>,
+    pub devaddr: DevAddr,
 }
 
 impl From<Session> for SessionKeys {
@@ -59,36 +67,29 @@ impl From<Session> for SessionKeys {
 }
 
 impl Session {
-    pub fn derive_new<T: AsRef<[u8]>>(
-        decrypt: &DecryptedJoinAcceptPayload<T>,
+    pub fn derive_new(
+        decrypt: &DecryptedJoinAcceptPayload<'_>,
         devnonce: DevNonce,
         credentials: &NetworkCredentials,
     ) -> Self {
         Self::new(
-            decrypt.derive_nwkskey(&devnonce, credentials.appkey(), &DefaultFactory),
-            decrypt.derive_appskey(&devnonce, credentials.appkey(), &DefaultFactory),
-            DevAddr::new([
-                decrypt.dev_addr().as_ref()[0],
-                decrypt.dev_addr().as_ref()[1],
-                decrypt.dev_addr().as_ref()[2],
-                decrypt.dev_addr().as_ref()[3],
-            ])
-            .unwrap(),
+            decrypt.derive_nwkskey(devnonce, &DefaultCrypto::new(credentials.appkey().inner())),
+            decrypt.derive_appskey(devnonce, &DefaultCrypto::new(credentials.appkey().inner())),
+            decrypt.dev_addr(),
         )
     }
 
-    pub fn new(nwkskey: NwkSKey, appskey: AppSKey, devaddr: DevAddr<[u8; 4]>) -> Self {
+    pub fn new(nwkskey: NwkSKey, appskey: AppSKey, devaddr: DevAddr) -> Self {
         Self {
             nwkskey,
             appskey,
             devaddr,
             confirmed: false,
-            fcnt_down: 0,
+            fcnt_down: None,
             fcnt_up: 0,
+            adr_ack_cnt: 0,
             uplink: uplink::Uplink::default(),
 
-            #[cfg(feature = "certification")]
-            override_adr: false,
             #[cfg(feature = "certification")]
             override_confirmed: None,
             #[cfg(feature = "certification")]
@@ -96,7 +97,7 @@ impl Session {
         }
     }
 
-    pub fn devaddr(&self) -> &DevAddr<[u8; 4]> {
+    pub fn devaddr(&self) -> &DevAddr {
         &self.devaddr
     }
     pub fn appskey(&self) -> &AppSKey {
@@ -109,6 +110,12 @@ impl Session {
 
     pub fn nwkskey(&self) -> &NwkSKey {
         &self.nwkskey
+    }
+
+    /// Frame counter of the last accepted downlink, or `None` before the first
+    /// downlink of the session.
+    pub fn fcnt_down(&self) -> Option<u32> {
+        self.fcnt_down
     }
 
     pub fn get_session_keys(&self) -> Option<SessionKeys> {
@@ -130,9 +137,8 @@ impl Session {
         snr: i8,
         ignore_mac: bool,
     ) -> Response {
-        if let Ok(PhyPayload::Data(DataPayload::Encrypted(encrypted_data))) =
-            lorawan_parse(rx.as_mut_for_read())
-        {
+        let bytes = rx.as_mut_for_read();
+        if let Ok(encrypted_data) = EncryptedDataPayload::parse(bytes) {
             {
                 // Drop oversized packets which exceed the maximum allowed
                 // transmission time defined by PHY layer.
@@ -141,7 +147,7 @@ impl Session {
                 let payload_len = encrypted_data.as_bytes().len();
                 if payload_len > max_payload_len as usize + MHDR_LEN + MIC_LEN {
                     info!("Dropping oversized payload.");
-                    return self.rx2_complete();
+                    return self.rx2_complete(configuration, region);
                 }
             }
 
@@ -152,46 +158,49 @@ impl Session {
             }
 
             #[cfg(feature = "certification")]
-            if let Some(port) = encrypted_data.f_port() {
-                if port > 0 {
-                    self.rx_app_cnt += 1;
-                }
+            if let Some(port) = encrypted_data.f_port()
+                && port > 0
+            {
+                self.rx_app_cnt += 1;
             }
             #[cfg(feature = "multicast")]
-            if let Some(port) = encrypted_data.f_port() {
-                if multicast.is_in_range(port) {
-                    return multicast.handle_rx(dl, encrypted_data).into();
-                }
-            }
-            let fcnt = encrypted_data.fhdr().fcnt() as u32;
-            let confirmed = encrypted_data.is_confirmed();
-            if encrypted_data.validate_mic(self.nwkskey().inner(), fcnt, &DefaultFactory)
-                && (fcnt > self.fcnt_down || fcnt == 0)
+            if let Some(port) = encrypted_data.f_port()
+                && multicast.is_in_range(port)
             {
-                self.fcnt_down = fcnt;
+                return multicast.handle_rx(dl, bytes).into();
+            }
+            let confirmed = encrypted_data.is_confirmed();
+            let Some(fcnt) = next_fcnt_down(self.fcnt_down, encrypted_data.fhdr().fcnt()) else {
+                return Response::NoUpdate;
+            };
+            let nwk_crypto = DefaultCrypto::new(self.nwkskey.inner());
+            let app_crypto = DefaultCrypto::new(self.appskey.inner());
+            if encrypted_data.validate_mic(&nwk_crypto, fcnt) {
+                self.fcnt_down = Some(fcnt);
+                // Any accepted downlink confirms connectivity for ADR.
+                self.adr_ack_cnt = 0;
                 // We can safely unwrap here because we already validated the MIC
-                let decrypted = encrypted_data
-                    .decrypt(
-                        Some(self.nwkskey().inner()),
-                        Some(self.appskey().inner()),
-                        self.fcnt_down,
-                        &DefaultFactory,
-                    )
-                    .unwrap();
+                let decrypted = DecryptedDataPayload::decrypt_in_place(
+                    bytes,
+                    Some(&nwk_crypto),
+                    Some(&app_crypto),
+                    fcnt,
+                )
+                .unwrap();
 
                 if !ignore_mac {
                     // MAC commands may be in the FHDR or the FRMPayload
                     self.handle_downlink_macs(
                         configuration,
                         region,
-                        MacCommandIterator::<DownlinkMacCommand<'_>>::new(decrypted.fhdr().data()),
+                        parse_downlink_mac_commands(decrypted.fhdr().f_opts()),
                         snr,
                     );
-                    if let FRMPayload::MACCommands(mac_cmds) = decrypted.frm_payload() {
+                    if let FrmPayload::MacCommands(mac_cmds) = decrypted.frm_payload() {
                         self.handle_downlink_macs(
                             configuration,
                             region,
-                            MacCommandIterator::<DownlinkMacCommand<'_>>::new(mac_cmds.data()),
+                            parse_downlink_mac_commands(mac_cmds),
                             snr,
                         );
                     }
@@ -207,23 +216,21 @@ impl Session {
                 } else {
                     // we can always increment fcnt_up when we receive a downlink
                     self.fcnt_up += 1;
-                    if let (Some(fport), FRMPayload::Data(data)) =
+                    if let (Some(fport), FrmPayload::Data(data)) =
                         (decrypted.f_port(), decrypted.frm_payload())
                     {
                         #[cfg(feature = "certification")]
                         if certification.fport(fport) {
                             use crate::mac::certification::Response::*;
-                            match certification
-                                .handle_message(data, self.fcnt_down.try_into().unwrap())
-                            {
+                            match certification.handle_message(data, fcnt as u16) {
                                 AdrBitChange(adr) => {
-                                    self.override_adr = adr;
+                                    configuration.adr_enabled = adr;
                                 }
                                 DutJoinReq => {
-                                    return Response::DeviceHandler(DeviceEvent::ResetMac)
+                                    return Response::DeviceHandler(DeviceEvent::ResetMac);
                                 }
                                 DutResetReq => {
-                                    return Response::DeviceHandler(DeviceEvent::ResetDevice)
+                                    return Response::DeviceHandler(DeviceEvent::ResetDevice);
                                 }
                                 LinkCheckReq => {
                                     return Response::LinkCheckReq;
@@ -237,7 +244,7 @@ impl Session {
                                 TxPeriodicityChange(periodicity) => {
                                     return Response::DeviceHandler(
                                         DeviceEvent::TxPeriodicityChange { periodicity },
-                                    )
+                                    );
                                 }
                                 UplinkPrepared => return Response::UplinkPrepared,
                                 NoUpdate => return Response::NoUpdate,
@@ -261,7 +268,11 @@ impl Session {
         Response::NoUpdate
     }
 
-    pub(crate) fn rx2_complete(&mut self) -> Response {
+    pub(crate) fn rx2_complete(
+        &mut self,
+        configuration: &mut super::Configuration,
+        region: &region::Configuration,
+    ) -> Response {
         // Until we handle NbTrans, there is no case where we should not increment FCntUp.
         if self.fcnt_up == 0xFFFF_FFFF {
             // if the FCnt is used up, the session has expired
@@ -269,6 +280,21 @@ impl Session {
         } else {
             self.fcnt_up += 1;
         }
+
+        if configuration.adr_enabled {
+            self.adr_ack_cnt = self.adr_ack_cnt.saturating_add(1);
+            // After ADR_ACK_LIMIT + N*ADR_ACK_DELAY uplinks without a downlink,
+            // step down the data rate to try to regain connectivity.
+            if self.adr_ack_cnt >= (ADR_ACK_LIMIT + ADR_ACK_DELAY) as u32 {
+                let past_limit = self.adr_ack_cnt - ADR_ACK_LIMIT as u32;
+                if past_limit.is_multiple_of(ADR_ACK_DELAY as u32)
+                    && let Some(dr) = next_lower_datarate(region, configuration.data_rate)
+                {
+                    configuration.data_rate = dr;
+                }
+            }
+        }
+
         if self.confirmed {
             Response::NoAck
         } else {
@@ -280,22 +306,24 @@ impl Session {
         &mut self,
         data: &SendData<'_>,
         tx_buffer: &mut RadioBuffer<N>,
+        configuration: &super::Configuration,
+        region: &region::Configuration,
     ) -> FcntUp {
         tx_buffer.clear();
         let fcnt = self.fcnt_up;
         let mut buf = [0u8; 256];
-        let mut phy = DataPayloadCreator::new(&mut buf).unwrap();
 
-        let mut fctrl = FCtrl(0x0, true);
-        if self.uplink.confirms_downlink() {
-            fctrl.set_ack();
+        let ack = self.uplink.confirms_downlink();
+        if ack {
             self.uplink.clear_downlink_confirmation();
         }
 
-        #[cfg(feature = "certification")]
-        if self.override_adr {
-            fctrl.set_adr()
-        }
+        let adr = configuration.adr_enabled;
+        // ADRACKReq asks the network for a downlink so ADR can keep working.
+        // It is not set when already at the lowest usable data rate.
+        let adr_ack_req = adr
+            && self.adr_ack_cnt >= ADR_ACK_LIMIT as u32
+            && next_lower_datarate(region, configuration.data_rate).is_some();
 
         self.confirmed = data.confirmed;
         #[cfg(feature = "certification")]
@@ -303,27 +331,44 @@ impl Session {
             self.confirmed = v;
         }
 
-        phy.set_confirmed(self.confirmed)
-            .set_fctrl(&fctrl)
-            .set_f_port(data.fport)
-            .set_dev_addr(self.devaddr)
-            .set_fcnt(fcnt);
-
-        let crypto_factory = DefaultFactory;
-        match phy.build(
-            data.data,
-            self.uplink.mac_commands(),
-            &self.nwkskey,
-            &self.appskey,
-            &crypto_factory,
-        ) {
+        // FPort 0 sends the queued MAC commands as the FRMPayload (encrypted
+        // with the NwkSKey) with FOpts left empty; the spec forbids
+        // application data on port 0. Any other port piggybacks the queued
+        // commands in FOpts.
+        let (f_opts, payload) = match NonZeroU8::new(data.fport) {
+            Some(f_port) => (self.uplink.mac_commands(), Payload::Data { f_port, data: data.data }),
+            None => {
+                if !data.data.is_empty() {
+                    panic!("Error assembling packet! Data payload with fport 0 not allowed");
+                }
+                (&[][..], Payload::MacCommands(self.uplink.mac_commands()))
+            }
+        };
+        let frame = DataFrame {
+            frame_type: if self.confirmed {
+                DataFrameType::ConfirmedUp
+            } else {
+                DataFrameType::UnconfirmedUp
+            },
+            dev_addr: self.devaddr,
+            adr,
+            adr_ack_req,
+            ack,
+            f_pending: false,
+            fcnt,
+            f_opts,
+            payload,
+        };
+        let nwk_crypto = DefaultCrypto::new(self.nwkskey.inner());
+        let app_crypto = DefaultCrypto::new(self.appskey.inner());
+        match frame.build_into(&mut buf, &nwk_crypto, Some(&app_crypto)) {
             Ok(packet) => {
-                self.uplink.clear_mac_commands(true);
                 tx_buffer.clear();
                 tx_buffer.extend_from_slice(packet).unwrap();
             }
             Err(e) => panic!("Error assembling packet! {:?} ", e),
         }
+        self.uplink.clear_mac_commands(true);
         fcnt
     }
 
@@ -331,12 +376,14 @@ impl Session {
         &mut self,
         configuration: &mut super::Configuration,
         region: &mut region::Configuration,
-        cmds: MacCommandIterator<'_, DownlinkMacCommand<'_>>,
+        cmds: MacCommands<'_, DownlinkMacCommand<'_>>,
         snr: i8,
     ) {
         use DownlinkMacCommand::*;
         let mut channel_mask = region.channel_mask_get();
-        let mut cmd_iter = cmds.into_iter().peekable();
+        // The iterator is fused after the first malformed command, so this
+        // processes the leading well-formed prefix of the stream.
+        let mut cmd_iter = cmds.filter_map(Result::ok).peekable();
         let mut num_adrreq = 0;
         while let Some(cmd) = cmd_iter.next() {
             match cmd {
@@ -406,13 +453,11 @@ impl Session {
                     };
 
                     let cm_ack = region.channel_mask_validate(&channel_mask, dr);
-                    if cm_ack {
-                        if let (Some(dr), Some(pw)) = (dr, pw) {
-                            // TODO: handle nbtrans
-                            configuration.data_rate = dr;
-                            configuration.tx_power = pw;
-                            region.channel_mask_set(channel_mask.clone());
-                        }
+                    if cm_ack && let (Some(dr), Some(pw)) = (dr, pw) {
+                        // TODO: handle nbtrans
+                        configuration.data_rate = dr;
+                        configuration.tx_power = pw;
+                        region.channel_mask_set(channel_mask.clone());
                     }
                     // Add matching number of LinkADRAns responses
                     for _ in 0..num_adrreq {
@@ -463,12 +508,11 @@ impl Session {
                             }
                         }
                     };
-                    if freq_ack {
-                        if let (Some(rx2_dr), Some(rx1_dr_offset)) = (rx2_dr, rx1_dr_offset) {
-                            configuration.rx2_data_rate = rx2_dr;
-                            configuration.rx2_frequency = Some(freq);
-                            configuration.rx1_dr_offset = rx1_dr_offset;
-                        }
+                    if freq_ack && let (Some(rx2_dr), Some(rx1_dr_offset)) = (rx2_dr, rx1_dr_offset)
+                    {
+                        configuration.rx2_data_rate = rx2_dr;
+                        configuration.rx2_frequency = Some(freq);
+                        configuration.rx1_dr_offset = rx1_dr_offset;
                     }
 
                     let mut cmd = RXParamSetupAnsCreator::new();
@@ -490,5 +534,220 @@ impl Session {
                 _ => (),
             }
         }
+    }
+}
+
+/// Next lower region-supported data rate, if any.
+fn next_lower_datarate(region: &region::Configuration, current: DR) -> Option<DR> {
+    let current = current as u8;
+    if current == 0 {
+        return None;
+    }
+    for candidate in (0..current).rev() {
+        if region.get_datarate(candidate).is_some() {
+            return Some(DR::from(candidate));
+        }
+    }
+    None
+}
+
+/// Rebuild the full 32-bit downlink frame counter from the 16-bit value carried
+/// on the wire and decide whether the frame is fresh.
+///
+/// Only the low 16 bits of the counter are transmitted (LoRaWAN 1.0.2
+/// §4.3.1.5); the receiver keeps the high 16 bits in `last` and advances them
+/// when the low half wraps. Returns the reconstructed counter to store, or
+/// `None` when the frame must be dropped because its counter does not advance
+/// past `last` or jumps further ahead than `MAX_FCNT_GAP` allows.
+///
+/// `last` is `None` until the first downlink of a session has been accepted, so
+/// that first frame is taken at face value instead of being compared against an
+/// initial counter.
+fn next_fcnt_down(last: Option<u32>, wire: u16) -> Option<u32> {
+    let Some(last) = last else {
+        return Some(u32::from(wire));
+    };
+    let high = last & 0xFFFF_0000;
+    let reconstructed = if wire >= last as u16 {
+        high | u32::from(wire)
+    } else {
+        // The low half wrapped, so the frame belongs to the next 16-bit epoch.
+        high.wrapping_add(0x1_0000) | u32::from(wire)
+    };
+    // Drop replays and counters that jump too far ahead. A stale frame from an
+    // earlier counter reconstructs to a value far beyond `last`, so the gap
+    // bound rejects it here before the MIC is even checked.
+    match reconstructed.checked_sub(last) {
+        Some(gap) if gap > 0 && gap <= MAX_FCNT_GAP as u32 => Some(reconstructed),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_fcnt_down;
+    use super::{SendData, Session};
+    use crate::mac::Mac;
+    use crate::radio::RadioBuffer;
+    use crate::region;
+    use crate::{AppSKey, NwkSKey};
+    use lorawan::default_crypto::DefaultCrypto;
+    use lorawan::maccommandcreator::LinkADRAnsCreator;
+    use lorawan::parser::{DecryptedDataPayload, DevAddr, EncryptedDataPayload, FrmPayload};
+    use lorawan::types::DR;
+
+    fn uplink_fctrl(session: &mut Session, mac: &Mac) -> lorawan::parser::FCtrl {
+        let mut tx: RadioBuffer<256> = RadioBuffer::new();
+        session.prepare_buffer::<256>(
+            &SendData { data: &[], fport: 1, confirmed: false },
+            &mut tx,
+            &mac.configuration,
+            &mac.region,
+        );
+        EncryptedDataPayload::parse(tx.as_mut_for_read()).unwrap().fhdr().fctrl()
+    }
+
+    fn eu868_mac() -> Mac {
+        Mac::new(region::Configuration::new(region::Region::EU868), 14, 0)
+    }
+
+    fn session() -> Session {
+        Session::new(NwkSKey::from([2; 16]), AppSKey::from([1; 16]), DevAddr::from_value(1))
+    }
+
+    #[test]
+    fn adr_bits_follow_configuration_and_ack_limit() {
+        let mut mac = eu868_mac();
+        mac.configuration.data_rate = DR::_5;
+        let mut session = session();
+
+        let fctrl = uplink_fctrl(&mut session, &mac);
+        assert!(fctrl.adr());
+        assert!(!fctrl.adr_ack_req());
+
+        session.adr_ack_cnt = super::ADR_ACK_LIMIT as u32;
+        let fctrl = uplink_fctrl(&mut session, &mac);
+        assert!(fctrl.adr());
+        assert!(fctrl.adr_ack_req());
+
+        mac.configuration.adr_enabled = false;
+        let fctrl = uplink_fctrl(&mut session, &mac);
+        assert!(!fctrl.adr());
+        assert!(!fctrl.adr_ack_req());
+    }
+
+    #[test]
+    fn adr_backoff_starts_after_ack_limit_and_delay() {
+        let mut mac = eu868_mac();
+        mac.configuration.data_rate = DR::_5;
+        let mut session = session();
+        session.adr_ack_cnt = (super::ADR_ACK_LIMIT + super::ADR_ACK_DELAY - 1) as u32;
+
+        session.rx2_complete(&mut mac.configuration, &mac.region);
+        assert_eq!(mac.configuration.data_rate, DR::_4);
+
+        for _ in 0..super::ADR_ACK_DELAY {
+            session.rx2_complete(&mut mac.configuration, &mac.region);
+        }
+        assert_eq!(mac.configuration.data_rate, DR::_3);
+    }
+
+    #[test]
+    fn adr_ack_req_stops_at_lowest_supported_datarate() {
+        let mut mac = eu868_mac();
+        mac.configuration.data_rate = DR::_0;
+        let mut session = session();
+        session.adr_ack_cnt = super::ADR_ACK_LIMIT as u32;
+
+        let fctrl = uplink_fctrl(&mut session, &mac);
+        assert!(fctrl.adr());
+        assert!(!fctrl.adr_ack_req());
+    }
+
+    /// FPort 0 sends the queued MAC commands as the FRMPayload (encrypted
+    /// with the NwkSKey), with FOpts left empty.
+    #[test]
+    fn fport_zero_sends_queued_mac_commands_in_frm_payload() {
+        let nwkskey = NwkSKey::from([2; 16]);
+        let appskey = AppSKey::from([1; 16]);
+        let mut session = Session::new(nwkskey, appskey, DevAddr::from_value(1));
+
+        let mut cmd = LinkADRAnsCreator::new();
+        cmd.set_channel_mask_ack(true).set_data_rate_ack(true).set_tx_power_ack(true);
+        let expected = cmd.build().to_vec();
+        session.uplink.add_mac_command(cmd);
+
+        let mut tx: RadioBuffer<256> = RadioBuffer::new();
+        let mac = Mac::new(region::Configuration::new(region::Region::EU868), 14, 0);
+        session.prepare_buffer::<256>(
+            &SendData { data: &[], fport: 0, confirmed: false },
+            &mut tx,
+            &mac.configuration,
+            &mac.region,
+        );
+
+        let bytes = tx.as_mut_for_read();
+        let nwk_crypto = DefaultCrypto::new(nwkskey.inner());
+        let decrypted =
+            DecryptedDataPayload::decrypt_in_place(bytes, Some(&nwk_crypto), None, 0).unwrap();
+        assert_eq!(decrypted.fhdr().f_opts(), &[] as &[u8]);
+        assert_eq!(decrypted.f_port(), Some(0));
+        assert_eq!(decrypted.frm_payload(), FrmPayload::MacCommands(&expected[..]));
+    }
+
+    #[test]
+    fn first_downlink_taken_at_face_value() {
+        // Before any downlink is seen, the wire value is accepted as-is even
+        // when it is zero (the counter both ends start from).
+        assert_eq!(next_fcnt_down(None, 0), Some(0));
+        assert_eq!(next_fcnt_down(None, 7), Some(7));
+    }
+
+    #[test]
+    fn increasing_counter_in_same_epoch() {
+        assert_eq!(next_fcnt_down(Some(5), 6), Some(6));
+        assert_eq!(next_fcnt_down(Some(100), 200), Some(200));
+    }
+
+    #[test]
+    fn jump_beyond_max_fcnt_gap_is_dropped() {
+        use super::MAX_FCNT_GAP;
+        let last = 5;
+        // A jump of exactly MAX_FCNT_GAP is still accepted.
+        let at_limit = last + MAX_FCNT_GAP as u16;
+        assert_eq!(next_fcnt_down(Some(last as u32), at_limit), Some(at_limit as u32));
+        // One past the limit is rejected.
+        assert_eq!(next_fcnt_down(Some(last as u32), at_limit + 1), None);
+    }
+
+    #[test]
+    fn replayed_or_stale_counter_is_dropped() {
+        // Exact replay of the last counter.
+        assert_eq!(next_fcnt_down(Some(6), 6), None);
+        // An older counter from the same epoch.
+        assert_eq!(next_fcnt_down(Some(6), 5), None);
+        // Once a downlink has been seen, a wire value of zero is stale like
+        // any other: it neither resets the counter nor bypasses the check.
+        assert_eq!(next_fcnt_down(Some(6), 0), None);
+    }
+
+    #[test]
+    fn counter_is_reconstructed_past_16_bits() {
+        // Wire wraps 0xFFFF -> 0x0000: the reconstructed value crosses into the
+        // next epoch rather than folding back to zero.
+        assert_eq!(next_fcnt_down(Some(0xFFFF), 0), Some(0x1_0000));
+        // Further progress inside the high epoch.
+        assert_eq!(next_fcnt_down(Some(0x1_0000), 1), Some(0x1_0001));
+        // A frame far into the session reconstructs correctly instead of
+        // capping at 0xFFFF.
+        assert_eq!(next_fcnt_down(Some(0x0003_FFFE), 0xFFFF), Some(0x0003_FFFF));
+        assert_eq!(next_fcnt_down(Some(0x0003_FFFF), 0), Some(0x0004_0000));
+    }
+
+    #[test]
+    fn near_top_of_range_does_not_wrap_backwards() {
+        // Reconstruction that would overflow the 32-bit counter is rejected
+        // rather than wrapping to a smaller value.
+        assert_eq!(next_fcnt_down(Some(0xFFFF_FFFE), 0), None);
     }
 }

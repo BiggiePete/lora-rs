@@ -1,6 +1,7 @@
 use lorawan::maccommandcreator::*;
 use lorawan::maccommands::*;
-use lorawan::types::{DLSettings, DataRateRange, Frequency, Redundancy, DR};
+use lorawan::maccommands::{parse_downlink_mac_commands, parse_uplink_mac_commands};
+use lorawan::types::{DLSettings, DR, DataRateRange, Frequency, Redundancy};
 
 macro_rules! test_helper {
     ( $cmd:ident, $data:ident, $name:ident, $type:ident, $size:expr, $( ( $method:ident, $val:expr ) ,)*) => {{
@@ -275,7 +276,7 @@ fn test_parse_mac_commands_empty_uplink() {
 #[test]
 fn test_parse_mac_commands_with_multiple_cmds() {
     let data = mac_cmds_payload();
-    let mut commands = parse_uplink_mac_commands(&data[..]);
+    let mut commands = parse_uplink_mac_commands(&data[..]).map(Result::unwrap);
     assert_eq!(commands.next(), Some(UplinkMacCommand::LinkCheckReq(LinkCheckReqPayload())));
     let expected = UplinkMacCommand::LinkADRAns(LinkADRAnsPayload::new(&data[2..]).unwrap());
     assert_eq!(commands.next(), Some(expected));
@@ -284,7 +285,7 @@ fn test_parse_mac_commands_with_multiple_cmds() {
 #[test]
 fn test_parse_mac_commands_with_multiple_cmds_with_payloads() {
     let data = [3, 0, 0, 0, 112, 3, 0, 0, 255, 0];
-    let mut commands = parse_downlink_mac_commands(&data);
+    let mut commands = parse_downlink_mac_commands(&data).map(Result::unwrap);
 
     assert_eq!(
         commands.next(),

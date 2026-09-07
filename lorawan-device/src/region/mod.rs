@@ -53,14 +53,17 @@ pub(crate) use dynamic_channel_plans::IN865;
 
 #[cfg(any(feature = "region-us915", feature = "region-au915"))]
 mod fixed_channel_plans;
-#[cfg(any(feature = "region-us915", feature = "region-au915"))]
-pub use fixed_channel_plans::Subband;
 #[cfg(feature = "region-au915")]
 pub use fixed_channel_plans::AU915;
+#[cfg(any(feature = "region-us915", feature = "region-au915"))]
+pub use fixed_channel_plans::Subband;
 #[cfg(feature = "region-us915")]
 pub use fixed_channel_plans::US915;
 
 pub(crate) trait ChannelRegion {
+    const MAX_RX1_DR_OFFSET: u8;
+    const DEFAULT_RX2_FREQ: u32;
+
     fn datarates() -> &'static [Option<Datarate>; NUM_DATARATES as usize];
 
     fn get_max_payload_length(datarate: DR, repeater_compatible: bool, dwell_time: bool) -> u8 {
@@ -197,6 +200,17 @@ pub(crate) struct Datarate {
     pub(crate) spreading_factor: SpreadingFactor,
     pub(crate) max_mac_payload_size: u8,
     max_mac_payload_size_with_dwell_time: u8,
+}
+
+/// The result of TX channel selection. Carries the DR actually used for the uplink (which may
+/// differ from the requested DR, eg: fixed-plan join frames force DR0/DR4 by channel) and the
+/// RX1 frequency paired with the selected channel, so RX windows can be derived from the
+/// transmission itself rather than recalled from region state at RX time.
+pub(crate) struct TxChannel {
+    pub(crate) datarate: Datarate,
+    pub(crate) dr: DR,
+    pub(crate) frequency: u32,
+    pub(crate) rx1_frequency: u32,
 }
 macro_rules! mut_region_dispatch {
   ($s:expr, $t:tt) => {
@@ -368,21 +382,22 @@ impl Configuration {
         rng: &mut RNG,
         datarate: DR,
         frame: &Frame,
-    ) -> TxConfig {
-        let (dr, frequency) = self.get_tx_dr_and_frequency(rng, datarate, frame);
-        TxConfig {
+    ) -> (TxConfig, TxChannel) {
+        let tx_channel = self.select_tx_channel(rng, datarate, frame);
+        let tx_config = TxConfig {
             // We can do this safely, as default output power will be positive
             pw: self.check_tx_power(0).unwrap().unwrap() as i8,
             rf: RfConfig {
-                frequency,
+                frequency: tx_channel.frequency,
                 bb: BaseBandModulationParams::new(
-                    dr.spreading_factor,
-                    dr.bandwidth,
+                    tx_channel.datarate.spreading_factor,
+                    tx_channel.datarate.bandwidth,
                     self.get_coding_rate(),
                 ),
-                max_payload_len: dr.max_mac_payload_size,
+                max_payload_len: tx_channel.datarate.max_mac_payload_size,
             },
-        }
+        };
+        (tx_config, tx_channel)
     }
 
     pub(crate) fn get_datarate(&self, dr: u8) -> Option<&Datarate> {
@@ -393,20 +408,17 @@ impl Configuration {
         region_dispatch!(self, check_tx_power, tx_power).map(Some)
     }
 
-    fn get_tx_dr_and_frequency<RNG: RngCore>(
+    fn select_tx_channel<RNG: RngCore>(
         &mut self,
         rng: &mut RNG,
         datarate: DR,
         frame: &Frame,
-    ) -> (Datarate, u32) {
-        mut_region_dispatch!(self, get_tx_dr_and_frequency, rng, datarate, frame)
+    ) -> TxChannel {
+        mut_region_dispatch!(self, select_tx_channel, rng, datarate, frame)
     }
 
-    pub(crate) fn process_join_accept<T: AsRef<[u8]>>(
-        &mut self,
-        join_accept: &DecryptedJoinAcceptPayload<T>,
-    ) {
-        mut_region_dispatch!(self, process_join_accept, join_accept)
+    pub(crate) fn process_join_accept(&mut self, c_f_list: Option<&CfList>) {
+        mut_region_dispatch!(self, process_join_accept, c_f_list)
     }
 
     pub(crate) fn channel_mask_get(&self) -> ChannelMask<9> {
@@ -438,8 +450,8 @@ impl Configuration {
         region_dispatch!(self, get_rx_datarate, tx_dr, rx1_dr_offset, window)
     }
 
-    pub(crate) fn get_rx_frequency(&self, frame: &Frame, window: &Window) -> u32 {
-        region_dispatch!(self, get_rx_frequency, frame, window)
+    pub(crate) fn get_rx2_frequency(&self) -> u32 {
+        region_dispatch!(self, get_rx2_frequency)
     }
 
     pub(crate) fn get_default_datarate(&self) -> DR {
@@ -510,10 +522,8 @@ from_region!(EU433);
 #[cfg(feature = "region-us915")]
 from_region!(US915);
 
-use lorawan::parser::DecryptedJoinAcceptPayload;
-
 pub(crate) trait RegionHandler {
-    fn process_join_accept<T: AsRef<[u8]>>(&mut self, join_accept: &DecryptedJoinAcceptPayload<T>);
+    fn process_join_accept(&mut self, c_f_list: Option<&CfList>);
 
     fn channel_mask_get(&self) -> ChannelMask<9>;
     fn channel_mask_set(&mut self, channel_mask: ChannelMask<9>);
@@ -543,15 +553,15 @@ pub(crate) trait RegionHandler {
         DR::_0
     }
 
-    fn get_tx_dr_and_frequency<RNG: RngCore>(
+    fn select_tx_channel<RNG: RngCore>(
         &mut self,
         rng: &mut RNG,
         datarate: DR,
         frame: &Frame,
-    ) -> (Datarate, u32);
+    ) -> TxChannel;
 
     fn get_rx_datarate(&self, datarate: DR, rx1_dr_offset: u8, window: &Window) -> DR;
-    fn get_rx_frequency(&self, frame: &Frame, window: &Window) -> u32;
+    fn get_rx2_frequency(&self) -> u32;
     fn get_coding_rate(&self) -> CodingRate {
         DEFAULT_CODING_RATE
     }
@@ -685,6 +695,51 @@ mod tests {
         assert_eq!(r.get_rx_datarate(DR::_7, 1, &Window::_1), DR::_8);
         // Invalid DR should return DR::_8
         assert_eq!(r.get_rx_datarate(DR::_12, 0, &Window::_1), DR::_8);
+    }
+
+    #[test]
+    #[cfg(feature = "region-us915")]
+    fn test_us915_chmaskcntl5_single_block() {
+        // ChMaskCntl=5: each of the 8 LSBs controls a bank of 8 125 kHz channels
+        // plus the paired 500 kHz channel: bit i -> channels [8i, 8i+7] and 64+i
+        // (RP002 2.5.5, Table 19)
+        let r = Configuration::new(Region::US915);
+        let mut mask = ChannelMask::<9>::default();
+        r.channel_mask_update(&mut mask, 5, ChannelMask::<2>::new(&[0b0000_0010, 0x00]).unwrap())
+            .unwrap();
+        for ch in 0..72 {
+            let expected = (8..=15).contains(&ch) || ch == 65;
+            assert_eq!(mask.is_enabled(ch).unwrap(), expected, "channel {ch}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "region-us915")]
+    fn test_us915_chmaskcntl5_multiple_blocks() {
+        let r = Configuration::new(Region::US915);
+        let mut mask = ChannelMask::<9>::default();
+        r.channel_mask_update(&mut mask, 5, ChannelMask::<2>::new(&[0b1000_0001, 0x00]).unwrap())
+            .unwrap();
+        for ch in 0..72 {
+            let expected = (0..=7).contains(&ch) || (56..=63).contains(&ch) || ch == 64 || ch == 71;
+            assert_eq!(mask.is_enabled(ch).unwrap(), expected, "channel {ch}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "region-us915")]
+    fn test_us915_chmaskcntl5_rfu_msbs_ignored() {
+        // the 8 MSBs of the ChMask are RFU and must not affect the result
+        let r = Configuration::new(Region::US915);
+        let mut with_rfu = ChannelMask::<9>::default();
+        let mut without_rfu = ChannelMask::<9>::default();
+        r.channel_mask_update(&mut with_rfu, 5, ChannelMask::<2>::new(&[0x05, 0xFF]).unwrap())
+            .unwrap();
+        r.channel_mask_update(&mut without_rfu, 5, ChannelMask::<2>::new(&[0x05, 0x00]).unwrap())
+            .unwrap();
+        for ch in 0..72 {
+            assert_eq!(with_rfu.is_enabled(ch).unwrap(), without_rfu.is_enabled(ch).unwrap());
+        }
     }
 
     #[test]

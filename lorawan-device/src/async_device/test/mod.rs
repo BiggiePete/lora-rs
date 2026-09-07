@@ -4,7 +4,6 @@ use crate::{
     region,
     test_util::*,
 };
-use lorawan::default_crypto::DefaultFactory;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -97,6 +96,76 @@ async fn test_no_join_accept() {
     } else {
         panic!("Unexpected response: {response:?}");
     }
+}
+
+#[tokio::test]
+async fn test_join_accept_dl_settings_applied() {
+    let (radio, timer, mut async_device) = setup();
+    // Run the device
+    let task = tokio::spawn(async move {
+        let response = async_device.join(&get_otaa_credentials()).await;
+        (async_device, response)
+    });
+
+    // Trigger beginning of RX1
+    timer.fire_most_recent().await;
+    // JoinAccept with RX1DROffset = 2 and RX2DataRate = DR10 (both valid for US915)
+    radio.handle_rxtx(handle_join_request_with_dl_settings::<5, 0x2A>).await;
+
+    let (device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(JoinResponse::JoinSuccess)));
+    assert_eq!(device.mac.configuration.rx1_dr_offset, 2);
+    assert_eq!(device.mac.configuration.rx2_data_rate, Some(region::DR::_10));
+}
+
+#[tokio::test]
+async fn test_join_accept_dl_settings_invalid_values_ignored() {
+    let (radio, timer, mut async_device) = setup();
+    // Run the device
+    let task = tokio::spawn(async move {
+        let response = async_device.join(&get_otaa_credentials()).await;
+        (async_device, response)
+    });
+
+    // Trigger beginning of RX1
+    timer.fire_most_recent().await;
+    // RX1DROffset = 7 (US915 max is 3) and RX2DataRate = DR7 (RFU in US915)
+    radio.handle_rxtx(handle_join_request_with_dl_settings::<6, 0x77>).await;
+
+    let (device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(JoinResponse::JoinSuccess)));
+    // Invalid values are ignored; defaults remain
+    assert_eq!(device.mac.configuration.rx1_dr_offset, 0);
+    assert_eq!(device.mac.configuration.rx2_data_rate, None);
+}
+
+#[tokio::test]
+async fn test_join_accept_bad_mic_changes_nothing() {
+    let (radio, timer, mut async_device) = setup();
+    let rx1_delay_default = async_device.mac.configuration.rx1_delay;
+    // Run the device
+    let task = tokio::spawn(async move {
+        let response = async_device.join(&get_otaa_credentials()).await;
+        (async_device, response)
+    });
+
+    // Trigger beginning of RX1
+    timer.fire_most_recent().await;
+    // JoinAccept built with the wrong key; carries RxDelay = 3 and DLSettings = 0x2A
+    radio.handle_rxtx(handle_join_request_bad_mic).await;
+    // Trigger end of RX1
+    radio.handle_timeout().await;
+    // Trigger start of RX2
+    timer.fire_most_recent().await;
+    // Trigger end of RX2
+    radio.handle_timeout().await;
+
+    let (device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(JoinResponse::NoJoinAccept)));
+    // The rejected accept must not have touched the configuration
+    assert_eq!(device.mac.configuration.rx1_delay, rx1_delay_default);
+    assert_eq!(device.mac.configuration.rx1_dr_offset, 0);
+    assert_eq!(device.mac.configuration.rx2_data_rate, None);
 }
 
 #[tokio::test]
@@ -266,16 +335,14 @@ async fn invalid_maccommands_in_frmpayload() {
         _config: RfConfig,
         rx_buffer: &mut [u8],
     ) -> usize {
-        let mut phy = lorawan::creator::DataPayloadCreator::new(rx_buffer).unwrap();
-        phy.set_confirmed(false);
-        phy.set_f_port(0);
-        phy.set_dev_addr(&[0; 4]);
-        phy.set_uplink(false);
-        phy.set_fcnt(16);
-        phy.set_fctrl(&lorawan::parser::FCtrl::new(0x00, true));
-        let finished = phy
-            .build(&[], [3, 192, 0, 0, 0], &get_key().into(), &get_key().into(), &DefaultFactory)
-            .unwrap();
+        let frame = lorawan::creator::DataFrame {
+            frame_type: lorawan::parser::DataFrameType::UnconfirmedDown,
+            dev_addr: get_dev_addr(),
+            fcnt: 16,
+            payload: lorawan::creator::Payload::MacCommands(&[3, 192, 0, 0, 0]),
+            ..Default::default()
+        };
+        let finished = frame.build_into(rx_buffer, &get_crypto(), Some(&get_crypto())).unwrap();
         finished.len()
     }
 
